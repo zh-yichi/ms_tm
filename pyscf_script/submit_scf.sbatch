@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=tm_scf
 #SBATCH --partition=gpuMI100x8
-#SBATCH --account=bdka-delta-gpu
+#SBATCH --account=becu-delta-gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64         # half the node (128 cores total)
