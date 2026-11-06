@@ -131,7 +131,7 @@ def run_one(mol, method, chkfile, logfile, args):
         dm = mf_.make_rdm1()
         nmf = mf_.newton()
         nmf.chkfile = chkfile
-        nmf.max_cycle = 60
+        nmf.max_cycle = args.newton_max_cycle
         nmf.conv_tol = args.conv_tol
         nmf.kernel(dm0=dm)
         mf_.mo_coeff, mf_.mo_energy, mf_.mo_occ = nmf.mo_coeff, nmf.mo_energy, nmf.mo_occ
@@ -153,16 +153,32 @@ def run_one(mol, method, chkfile, logfile, args):
         mo_i, mo_e, stable_i, stable_e, eigs = _stability_with_eigs(
             mf, logfile, internal=True, external=external)
         rec['stab_eigs'].append(eigs)
+        min_eig = min([v for k, v in eigs.items() if k.endswith('_internal') and v is not None]
+                      or [None], key=lambda x: x if x is not None else 0)
+        if (not stable_i) and min_eig is not None and min_eig > -args.stab_tol:
+            log.note('lowest internal Hessian eigenvalue %.3e > -stab_tol (%.1e): treated as stable',
+                     min_eig, args.stab_tol)
+            rec['note'].append('internal eig %.1e within stab_tol, treated as stable' % min_eig)
+            stable_i = True
         if stable_i or it == args.max_stab:
             break
         rec['stab_rounds'] += 1
         log.note('internal instability found -> following the lowest Hessian '
                  'eigenvector and re-converging')
+        e_old = mf.e_tot
         dm = mf.make_rdm1(mo_i, mf.mo_occ)
         mf, how = converge(mf, dm)
         rec['converged_by'] = how
         if not mf.converged:
             rec['note'].append('SCF NOT CONVERGED after following instability')
+        elif mf.e_tot > e_old - 1e-8:
+            # following the "instability" did not lower the energy: a zero mode
+            # (e.g. rotation among degenerate orbitals), not a real instability
+            log.note('following the instability did not lower the energy (%.10f -> %.10f): '
+                     'zero mode, stop', e_old, mf.e_tot)
+            rec['note'].append('instability following did not lower E; zero mode, treated as stable')
+            stable_i = True
+            break
 
     rec['converged'] = bool(mf.converged)
     rec['internal_stable'] = None if stable_i is None else bool(stable_i)
@@ -196,6 +212,9 @@ def main():
     ap.add_argument('--level-shift', type=float, default=0.4)
     ap.add_argument('--max-cycle', type=int, default=200)
     ap.add_argument('--max-stab', type=int, default=3)
+    ap.add_argument('--newton-max-cycle', type=int, default=60)
+    ap.add_argument('--stab-tol', type=float, default=1e-5,
+                    help='internal Hessian eigenvalue above -stab_tol counts as stable')
     ap.add_argument('--conv-tol', type=float, default=1e-9)
     ap.add_argument('--memory', type=int, default=4000, help='MB per calculation')
     ap.add_argument('--force', action='store_true', help='rerun even if json exists')
