@@ -8,7 +8,7 @@
 # and chkfiles are not overwritten.  Copy the new <stem>/* over the old ones
 # once you are happy with them.  Thread count comes from OMP_NUM_THREADS.
 cd "$(dirname "$0")"
-RES=${1:-results}
+RES=${1:-results_minao}
 OUT=${2:-results_rerun}
 XYZDIR=../xyzfiles
 

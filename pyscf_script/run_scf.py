@@ -10,7 +10,8 @@ Per system:
   <outdir>/<stem>/<stem>.{rhf,uhf}.json   result record
 
 Per method:
-  * DIIS SCF (level_shift = 0.4, max_cycle = 200)
+  * DIIS SCF (level_shift = 0.4, max_cycle = 200) from the --init-guess density
+    (default minao)
   * if not converged -> second-order (Newton) SCF from the DIIS density
   * second-order (orbital-Hessian) stability analysis:
       internal  : RHF->RHF, ROHF->ROHF, UHF->UHF   (followed if unstable)
@@ -26,6 +27,7 @@ Usage:
   python run_scf.py                       # all xyz files under ../xyzfiles (deduplicated)
   python run_scf.py a.xyz b.xyz           # only these files
   python run_scf.py --methods rhf         # only one method
+  python run_scf.py --init-guess atom --outdir results_atom   # other initial guess
 """
 import argparse
 import glob
@@ -114,12 +116,13 @@ def run_one(mol, method, chkfile, logfile, args):
     mf.max_cycle = args.max_cycle
     mf.conv_tol = args.conv_tol
     mf.diis_space = 12
+    mf.init_guess = args.init_guess     # used by kernel() when dm0 is None (RHF/ROHF)
 
     dm0 = None
     if method == 'uhf':
         # break alpha/beta symmetry in the initial guess so that singlets can
         # relax to a spin-polarized solution if one exists
-        dm0 = np.asarray(mf.get_init_guess())
+        dm0 = np.asarray(mf.get_init_guess(key=args.init_guess))
         if mol.spin == 0:
             dm0 = np.array([dm0[0] * 1.05, dm0[1] * 0.95])
 
@@ -207,8 +210,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('files', nargs='*', help='xyz files (default: all under --xyzdir)')
     ap.add_argument('--xyzdir', default=os.path.join(here, '..', 'xyzfiles'))
-    ap.add_argument('--outdir', default=os.path.join(here, 'results'))
+    ap.add_argument('--outdir', default=os.path.join(here, 'results_minao'))
     ap.add_argument('--methods', default='rhf,uhf')
+    ap.add_argument('--init-guess', default='minao',
+                    help="pyscf initial guess: minao (default), atom, huckel, 1e, vsap, ...")
     ap.add_argument('--level-shift', type=float, default=0.4)
     ap.add_argument('--max-cycle', type=int, default=200)
     ap.add_argument('--max-stab', type=int, default=3)
@@ -263,7 +268,9 @@ def main():
             rec.update(name=stem, xyz=paths, charge=charge, mult=mult,
                        subdirs=[os.path.basename(os.path.dirname(p)) for p in paths],
                        chkfile=chkf, logfile=logf, basis=BASIS, x2c=True,
-                       level_shift=args.level_shift, time_s=round(time.time() - t0, 1))
+                       level_shift=args.level_shift, init_guess=args.init_guess,
+                       max_cycle=args.max_cycle, newton_max_cycle=args.newton_max_cycle,
+                       max_stab=args.max_stab, stab_tol=args.stab_tol, time_s=round(time.time() - t0, 1))
             with open(os.path.join(sysdir, '%s.%s.json' % (stem, method)), 'w') as f:
                 json.dump(rec, f, indent=1)
             print('%-50s %-4s E=%-18s conv=%-5s by=%-6s stab_i=%-5s stab_e=%-5s %5.0fs %s' % (

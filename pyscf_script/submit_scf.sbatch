@@ -23,7 +23,7 @@ NW=8                               # number of concurrent pyscf workers
 NT=$(( SLURM_CPUS_PER_TASK / NW )) # threads per worker
 MEM_MB=$(( 900000 / NW * 8 / 10 )) # pyscf max_memory per worker (MB), 80% share
 XYZDIR=../xyzfiles                 # relative to this directory
-OUTDIR=results
+OUTDIR=results_minao
 
 module purge
 module list

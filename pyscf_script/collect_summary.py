@@ -3,7 +3,7 @@
 import glob, json, os, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
-outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, 'results')
+outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, 'results_minao')
 recs = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(outdir, '*', '*.json')))]
 for r in recs:   # lowest internal Hessian eigenvalue of the final stability round
     eigs = r.get('stab_eigs') or []

@@ -35,5 +35,5 @@ export JAX_PLATFORM_NAME="cpu"
 
 echo "node: $(hostname)"
 cd "$SLURM_SUBMIT_DIR"
-./rerun_problems.sh results results_rerun
+./rerun_problems.sh results_minao results_rerun
 echo "done: $(date)"
