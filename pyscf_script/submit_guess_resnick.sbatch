@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32         # fits every CPU node type (32/56/64 cores per node)
 #SBATCH --mem=64G                  # 2 GB/core; well under the 192 GB of a standard node
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=slurm_guess.out
 #SBATCH --error=slurm_guess.err
 
