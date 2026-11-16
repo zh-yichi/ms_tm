@@ -1,0 +1,1039 @@
+#INFO: **** input file is /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/rerun_newton.py ****
+#!/usr/bin/env python
+"""Second-order (Newton) SCF search for the systems whose dz energy is ABOVE the
+reference energy (sfX2C-1e / cc-pVDZ-DK).
+
+Targets: every (system, method) in ./results with dE_ref_mEh > --tol-mEh
+(the records listed as "... mEh ABOVE the reference energy" in results/problems.txt).
+
+For each target, one calculation per initial guess (--guesses):
+    minao, atom, huckel, ...   pyscf initial guesses
+    rhfchk  (UHF only)         RHF/ROHF orbitals of the same system (the one found by
+                               this script if RHF was a target too, else ./results)
+    current                    orbitals of the present ./results solution
+Each calculation uses the Newton solver only (no DIIS):
+    Newton SCF -> internal stability analysis -> if unstable, step along the lowest
+    Hessian eigenvector in BOTH directions (+v and -v), re-converge both with Newton
+    and keep the lower one -> repeat until stable.
+Only the lowest solution over all guesses is kept (stable ones are preferred):
+
+    results_newton/<stem>/<stem>.<method>.chk     orbitals of the lowest solution
+    results_newton/<stem>/<stem>.<method>.json    its record + the energy of every guess
+    results_newton/<stem>/<stem>.newton.log       pyscf output of all calculations
+
+  python rerun_newton.py                  # all targets (finished ones are skipped)
+  python rerun_newton.py --list           # only print the targets (xyz file and methods)
+  python rerun_newton.py a.xyz b.xyz      # only these systems (stems or xyz files)
+  python rerun_newton.py --replace        # also copy a solution that is lower than the
+                                          # present one over ./results/<stem>/ (json + chk)
+  python rerun_newton.py --summary        # table of what was found
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import sys
+import time
+import traceback
+
+import numpy as np
+
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(here, '..'))
+from pyscf import scf, lib
+from pyscf.lib import logger
+from scf_lowest import (parse_xyz, build_mol, _stability_with_eigs, dm_from_rhf_chk,
+                        load_json, VERBOSE, E_TOL)
+
+BASIS = 'cc-pvdz-dk'
+TIE = 1e-7      # Eh; energies closer than this are the same solution
+
+
+def new_mf(mol, method):
+    return (scf.RHF(mol) if method == 'rhf' else scf.UHF(mol)).x2c()   # RHF -> ROHF if mol.spin > 0
+
+
+def newton(mf, chk, conv_tol, max_cycle, dm0=None, mo=None, occ=None):
+    """Newton SCF from a density matrix or from orbitals.  Returns a state dict."""
+    nmf = mf.newton()
+    nmf.chkfile = chk
+    nmf.max_cycle = max_cycle
+    nmf.conv_tol = conv_tol
+    if mo is not None:
+        nmf.kernel(np.asarray(mo), np.asarray(occ))
+    else:
+        nmf.kernel(dm0=dm0)
+    return dict(mo_coeff=nmf.mo_coeff, mo_energy=nmf.mo_energy, mo_occ=nmf.mo_occ,
+                e_tot=float(nmf.e_tot), converged=bool(nmf.converged))
+
+
+def set_state(mf, s):
+    mf.mo_coeff, mf.mo_energy, mf.mo_occ = s['mo_coeff'], s['mo_energy'], s['mo_occ']
+    mf.e_tot, mf.converged = s['e_tot'], s['converged']
+    return mf
+
+
+def opposite_step(mo0, mo1, ovlp):
+    """mo1 = mo0.U (pyscf's step along +v).  Returns mo0.U^T, the step along -v."""
+    mo0, mo1 = np.asarray(mo0), np.asarray(mo1)
+    if mo0.ndim == 3:
+        return np.array([opposite_step(a, b, ovlp) for a, b in zip(mo0, mo1)])
+    u = mo0.T.dot(ovlp).dot(mo1)
+    return mo0.dot(u.T)
+
+
+def start_density(mol, mf, method, guess, rhf_chk, cur_chk):
+    """Initial density matrix for this guess, or None if it is not available."""
+    if guess == 'rhfchk':
+        if method != 'uhf' or not (rhf_chk and os.path.exists(rhf_chk)):
+            return None
+        dm0 = dm_from_rhf_chk(rhf_chk)
+    elif guess == 'current':
+        if not (cur_chk and os.path.exists(cur_chk)):
+            return None
+        return mf.from_chk(cur_chk)
+    else:
+        dm0 = np.asarray(mf.get_init_guess(key=guess))
+    if method == 'uhf' and mol.spin == 0:
+        # break alpha/beta symmetry so that singlets can relax to a spin-polarized solution
+        dm0 = np.array([dm0[0] * 1.05, dm0[1] * 0.95])
+    return dm0
+
+
+def run_guess(mol, method, guess, dm0, chk, logfile, a):
+    """Newton SCF + stability following (both directions) from one initial density."""
+    log = logger.new_logger(mol, VERBOSE)
+    log.note('\n' + '=' * 70 + '\n  %s   %s   charge=%d  2S=%d  basis=%s  sfX2C-1e   NEWTON   guess: %s\n'
+             % (method.upper(), os.path.basename(chk), mol.charge, mol.spin, BASIS, guess) + '=' * 70)
+    is_rohf = (method == 'rhf' and mol.spin > 0)
+    external = a.external == 'on' and not is_rohf
+    rec = {'guess': guess, 'converged': False, 'internal_stable': None, 'external_stable': None,
+           'stab_rounds': 0, 'stab_eigs': [], 'energy': None, 's2': None, 'note': []}
+    mf = new_mf(mol, method)
+    mf.chkfile = chk
+    mf.conv_tol = a.conv_tol
+    ovlp = mf.get_ovlp()
+    state = newton(mf, chk, a.conv_tol, a.newton_max_cycle, dm0=dm0)
+    set_state(mf, state)
+    if not state['converged']:
+        rec['note'].append('Newton SCF NOT CONVERGED')
+
+    stable_i = stable_e = None
+    for it in range(a.max_stab + 1):
+        if not mf.converged:
+            break
+        log.note('--- stability analysis, round %d ---', it)
+        mo_i, mo_e, stable_i, stable_e, eigs = _stability_with_eigs(mf, logfile, True, external)
+        if not external:
+            stable_e = None
+        rec['stab_eigs'].append(eigs)
+        vals = [v for k, v in eigs.items() if k.endswith('_internal') and v is not None]
+        if (not stable_i) and vals and min(vals) > -a.stab_tol:
+            rec['note'].append('internal eig %.1e within stab_tol, treated as stable' % min(vals))
+            stable_i = True
+        if stable_i or it == a.max_stab:
+            break
+        rec['stab_rounds'] += 1
+        e_old, tried = state['e_tot'], []
+        for sign, mo in (('+v', mo_i), ('-v', opposite_step(state['mo_coeff'], mo_i, ovlp))):
+            log.note('internal instability -> step along %s and Newton SCF', sign)
+            try:
+                s = newton(mf, chk, a.conv_tol, a.newton_max_cycle, mo=mo, occ=state['mo_occ'])
+            except Exception as ex:
+                log.note('step %s failed: %r', sign, ex)
+                continue
+            log.note('step %s: E = %.10f  converged = %s', sign, s['e_tot'], s['converged'])
+            if s['converged']:
+                tried.append(s)
+        set_state(mf, state)
+        if not tried:
+            rec['note'].append('Newton SCF NOT CONVERGED after following the instability; kept the unstable solution')
+            break
+        best = min(tried, key=lambda s: s['e_tot'])
+        if best['e_tot'] > e_old - 1e-8:
+            log.note('neither direction lowered the energy (%.10f): zero mode, stop', e_old)
+            rec['note'].append('instability following did not lower E; zero mode, treated as stable')
+            stable_i = True
+            break
+        state = best
+        set_state(mf, state)
+
+    rec['converged'] = bool(mf.converged)
+    rec['internal_stable'] = None if stable_i is None else bool(stable_i)
+    rec['external_stable'] = None if stable_e is None else bool(stable_e)
+    if rec['converged'] and rec['internal_stable'] is False:
+        rec['note'].append('still internally UNSTABLE')
+    if rec['converged'] and rec['external_stable'] is False:
+        rec['note'].append('external instability (%s)' % ('RHF->UHF or real->complex' if method == 'rhf'
+                                                          else 'UHF->GHF or real->complex'))
+    if rec['converged']:
+        rec['energy'] = float(mf.e_tot)
+        if method == 'uhf' or is_rohf:
+            rec['s2'] = float(mf.spin_square()[0])
+        mf.dump_chk({'e_tot': mf.e_tot, 'mo_energy': mf.mo_energy,
+                     'mo_coeff': mf.mo_coeff, 'mo_occ': mf.mo_occ})
+    rec['scf_class'] = type(mf).__name__
+    log.note('RESULT %s NEWTON guess=%s  E=%s  converged=%s  internal_stable=%s  <S^2>=%s',
+             method.upper(), guess, rec['energy'], rec['converged'], rec['internal_stable'], rec['s2'])
+    return rec
+
+
+def find_targets(resdir, tol_mEh, only, methods):
+    """{stem: {method: present record}} for the records above the reference energy."""
+    out = {}
+    for f in sorted(glob.glob(os.path.join(resdir, '*', '*.json'))):
+        r = json.load(open(f))
+        if r.get('method') not in methods or (only and r['name'] not in only):
+            continue
+        d = r.get('dE_ref_mEh')
+        if (d is not None and d > tol_mEh) or (only and d is None):
+            out.setdefault(r['name'], {})[r['method']] = r
+    return out
+
+
+def summary(outdir):
+    rows = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(outdir, '*', '*.json')))]
+    print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
+        'system', 'meth', 'guess', 'E', 'dE_ref/mEh', 'dE_old/mEh', '<S^2>', 'stable', 'all guesses: E - E_lowest (mEh)'))
+    for r in rows:
+        f = lambda v, p='%.4f': '' if v is None else p % v
+        cand = '  '.join('%s:%s' % (c['guess'], 'fail' if c['energy'] is None else '%.3f' % ((c['energy'] - r['energy']) * 1e3))
+                         for c in r['candidates']) if r.get('energy') is not None else 'nothing converged'
+        print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
+            r['name'][:22], r['method'], r.get('init_guess'), f(r.get('energy'), '%.8f'), f(r.get('dE_ref_mEh')),
+            f(r.get('dE_prev_mEh')), f(r.get('s2'), '%.3f'), r.get('internal_stable'), cand))
+    n = sum(1 for r in rows if r.get('dE_ref_mEh') is not None and r['dE_ref_mEh'] <= E_TOL * 1e3)
+    print('%d records, %d at or below the reference energy' % (len(rows), n))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('systems', nargs='*', help='stems or xyz files (default: all records above the reference)')
+    ap.add_argument('--xyzdir', default=os.path.join(here, '..', 'xyzfiles'))
+    ap.add_argument('--resdir', default=os.path.join(here, 'results'), help='present dz results')
+    ap.add_argument('--outdir', default=os.path.join(here, 'results_newton'))
+    ap.add_argument('--methods', default='rhf,uhf')
+    ap.add_argument('--guesses', default='minao,atom,huckel,rhfchk,current')
+    ap.add_argument('--tol-mEh', type=float, default=E_TOL * 1e3,
+                    help='rerun records more than this above the reference (default %(default)s)')
+    ap.add_argument('--conv-tol', type=float, default=1e-9)
+    ap.add_argument('--newton-max-cycle', type=int, default=200)
+    ap.add_argument('--max-stab', type=int, default=15)
+    ap.add_argument('--stab-tol', type=float, default=1e-4)
+    ap.add_argument('--external', choices=['on', 'off'], default='off',
+                    help='also run the external stability analysis (recorded only)')
+    ap.add_argument('--memory', type=int, default=4000, help='MB per calculation')
+    ap.add_argument('--force', action='store_true', help='rerun even if the json exists')
+    ap.add_argument('--replace', action='store_true',
+                    help='copy solutions lower than the present one over <resdir>/<stem>/ (json and chk)')
+    ap.add_argument('--list', action='store_true', help='only print "<xyz file> <methods>" of the targets')
+    ap.add_argument('--summary', action='store_true', help='only print the table of results_newton')
+    a = ap.parse_args()
+    if a.summary:
+        summary(a.outdir)
+        return
+
+    only = {os.path.splitext(os.path.basename(s))[0] for s in a.systems}
+    targets = find_targets(a.resdir, a.tol_mEh, only, a.methods.split(','))
+    xyz = {s: sorted(glob.glob(os.path.join(a.xyzdir, '*', s + '.xyz'))) for s in targets}
+    if a.list:
+        for s in targets:
+            print(xyz[s][0], ','.join(sorted(targets[s])))
+        return
+    print('threads:', lib.num_threads(), ' targets:', sum(len(v) for v in targets.values()),
+          'records in', len(targets), 'systems', flush=True)
+
+    for stem, todo in targets.items():
+        sysdir = os.path.join(a.outdir, stem)
+        jf = lambda m, d=sysdir: os.path.join(d, '%s.%s.json' % (stem, m))
+        chk = lambda m, d=sysdir: os.path.join(d, '%s.%s.chk' % (stem, m))
+        olddir = os.path.join(a.resdir, stem)
+        methods = [m for m in ('rhf', 'uhf') if m in todo and (a.force or not os.path.exists(jf(m)))]
+        if not methods:
+            print('skip (done):', stem, flush=True)
+            continue
+        os.makedirs(sysdir, exist_ok=True)
+        logf = os.path.join(sysdir, '%s.newton.log' % stem)
+        mol = build_mol(xyz[stem][0], BASIS, logf, a.memory)
+        for method in methods:          # rhf first: its orbitals are the 'rhfchk' guess of uhf
+            t0, old = time.time(), todo[method]
+            own_rhf = load_json(jf('rhf'))
+            rhf_chk = chk('rhf') if (own_rhf and own_rhf.get('converged')) else chk('rhf', olddir)
+            cands, best, tmp_best = [], None, chk(method) + '.best'
+            for guess in a.guesses.split(','):
+                tmp = chk(method) + '.' + guess
+                try:
+                    dm0 = start_density(mol, new_mf(mol, method), method, guess, rhf_chk, chk(method, olddir))
+                    if dm0 is None:
+                        print('  %-22s %-4s %-8s not available, skipped' % (stem[:22], method, guess), flush=True)
+                        continue
+                    rec = run_guess(mol, method, guess, dm0, tmp, logf, a)
+                except Exception as ex:
+                    traceback.print_exc()
+                    rec = {'guess': guess, 'converged': False, 'energy': None, 'internal_stable': None,
+                           's2': None, 'note': ['ERROR: %r' % ex]}
+                cands.append(rec)
+                print('  %-22s %-4s %-8s E=%-18s conv=%-5s stab_i=%-5s <S^2>=%-7s %s' % (
+                    stem[:22], method, guess, rec['energy'], rec['converged'], rec['internal_stable'],
+                    None if rec.get('s2') is None else round(rec['s2'], 4), '; '.join(rec['note'])), flush=True)
+                # lowest converged solution; an internally stable one beats an unstable one
+                key = lambda r: (r['internal_stable'] is not True, r['energy'])
+                if rec['energy'] is not None and (best is None or key(rec) < key(best)
+                                                  and not (key(rec)[0] == key(best)[0]
+                                                           and rec['energy'] > best['energy'] - TIE)):
+                    best = rec
+                    shutil.move(tmp, tmp_best)
+                elif os.path.exists(tmp):
+                    os.remove(tmp)
+            out = dict(best) if best else {'converged': False, 'energy': None, 'internal_stable': None,
+                                           'note': ['no guess converged']}
+            out['note'] = list(out.get('note', []))
+            out.update(method=method, name=stem, init_guess=out.pop('guess', None), solver='newton',
+                       start='newton:%s' % (best['guess'] if best else None),
+                       candidates=[{k: c.get(k) for k in ('guess', 'energy', 's2', 'converged', 'internal_stable',
+                                                          'stab_rounds', 'note')} for c in cands],
+                       ref_energy=old.get('ref_energy'), ref_s2=old.get('ref_s2'), prev_energy=old.get('energy'),
+                       prev_s2=old.get('s2'), xyz=xyz[stem], charge=old.get('charge'), mult=old.get('mult'),
+                       subdirs=old.get('subdirs'), basis=BASIS, x2c=True, nao=mol.nao, nelec=mol.nelec,
+                       chkfile=chk(method), logfile=logf, conv_tol=a.conv_tol,
+                       newton_max_cycle=a.newton_max_cycle, max_stab=a.max_stab, stab_tol=a.stab_tol,
+                       time_s=round(time.time() - t0, 1))
+            if best:
+                shutil.move(tmp_best, chk(method))
+                for k, e0 in (('dE_ref_mEh', old.get('ref_energy')), ('dE_prev_mEh', old.get('energy'))):
+                    out[k] = None if e0 is None else (best['energy'] - e0) * 1e3
+                if out['dE_ref_mEh'] is not None and abs(out['dE_ref_mEh']) > E_TOL * 1e3:
+                    out['note'].append('%+.4f mEh relative to the reference energy' % out['dE_ref_mEh'])
+            with open(jf(method), 'w') as f:
+                json.dump(out, f, indent=1)
+            fm = lambda v: 'n/a' if v is None else '%+.4f' % v
+            print('%-22s %-4s LOWEST: %s  E=%s  vs reference %s mEh, vs present dz result %s mEh  (%.0fs)' % (
+                stem[:22], method, out['init_guess'], out['energy'], fm(out.get('dE_ref_mEh')),
+                fm(out.get('dE_prev_mEh')), out['time_s']), flush=True)
+            if a.replace and best and out.get('dE_prev_mEh') is not None and out['dE_prev_mEh'] < -E_TOL * 1e3 \
+                    and best['internal_stable']:
+                rep = dict(out, chkfile=chk(method, olddir))
+                shutil.copy(chk(method), chk(method, olddir))
+                with open(jf(method, olddir), 'w') as f:
+                    json.dump(rep, f, indent=1)
+                print('   -> replaced %s' % jf(method, olddir), flush=True)
+        mol.stdout.close()
+
+
+if __name__ == '__main__':
+    main()
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-54-35.cm.cluster', release='5.14.0-427.13.1.el9_4.x86_64', version='#1 SMP PREEMPT_DYNAMIC Wed Apr 10 10:29:16 EDT 2024', machine='x86_64')  Threads 4
+Python 3.11.15 | packaged by conda-forge | (main, Aug 11 2026, 10:26:29) [GCC 14.4.0]
+numpy 2.2.6  scipy 1.17.1  h5py 3.16.0
+Date: Sun Nov 15 21:09:49 2026
+PySCF version 2.14.0
+PySCF path  /resnick/groups/sharmagroup/yichi/pyscf
+GIT HEAD (branch master) 14fb93158ec9c97ae1d67462ea47b5b27ce63aca
+
+[ENV] PYSCF_EXT_PATH /resnick/groups/sharmagroup/yichi/pyscf-forge
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 9
+[INPUT] num. electrons = 67
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 1
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = Angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Ni     0.943891977769   0.025366093718   0.057156610445 AA    1.783697329157   0.047934969977   0.108010339950 Bohr   0.0
+[INPUT]  2 Al    -1.189681864326  -0.993290675677   0.152042984499 AA   -2.248172898938  -1.877047339114   0.287319599865 Bohr   0.0
+[INPUT]  3 F      0.119310363001   1.920304705065   0.011127035668 AA    0.225463909894   3.628849968287   0.021027049991 Bohr   0.0
+[INPUT]  4 O     -1.879398396495   0.606884904934  -0.254215880031 AA   -3.551548248322   1.146846259458  -0.480398389774 Bohr   0.0
+[INPUT]  5 B      0.911385923493  -1.686496374827  -0.330429077308 AA    1.722269789186  -3.187016258495  -0.624420459705 Bohr   0.0
+[INPUT]  6 H     -2.257229739556  -1.865492466082   0.932715014231 AA   -4.265546007984  -3.525269848334   1.762575929166 Bohr   0.0
+[INPUT]  7 H     -0.812806077721   1.536461781887  -0.128399473729 AA   -1.535980879275   2.903491968628  -0.242639839886 Bohr   0.0
+[INPUT]  8 H     -2.779479597197   0.868368795823  -0.050899148138 AA   -5.252455207519   1.640979199224  -0.096185449954 Bohr   0.0
+[INPUT]  9 H      1.062103890591  -2.813268668079  -0.675209789826 AA    2.007085469052  -5.316307297489  -1.275961579396 Bohr   0.0
+
+nuclear repulsion = 377.049995726481
+number of shells = 39
+number of NR pGTOs = 269
+number of NR cGTOs = 123
+basis = cc-pvdz-dk
+ecp = {}
+CPU time:         1.38
+
+======================================================================
+  UHF   AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.minao   charge=0  2S=1  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: minao
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.minao
+max_memory 22528 MB (current use 138 MB)
+number electrons alpha = 34  beta = 33
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.minao
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 22528 MB (current use 138 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 34  HOMO = 0.0691030404531796  LUMO = 0.0748081351881913
+  beta  nocc = 33  HOMO = 0.0594755365272706  LUMO = 0.0691030404531796
+
+WARN: HOMO 0.0691030404531796 >= LUMO 0.0691030404531796
+
+Initial guess E= -1950.44213168288  |g|= 6.70382
+macro= 0  E= -1961.39791054012  delta_E= -10.9558  |g|= 1.39335  3 KF 15 JK
+macro= 1  E= -1962.66778330651  delta_E= -1.26987  |g|= 0.277627  3 KF 17 JK
+macro= 2  E= -1962.75934497796  delta_E= -0.0915617  |g|= 0.137952  3 KF 13 JK
+macro= 3  E= -1962.82048798625  delta_E= -0.061143  |g|= 0.0769475  4 KF 17 JK
+macro= 4  E= -1962.83126241507  delta_E= -0.0107744  |g|= 0.0449368  4 KF 22 JK
+macro= 5  E= -1962.82343855961  delta_E= 0.00782386  |g|= 0.0298278  2 KF 7 JK
+macro= 6  E= -1962.83669487455  delta_E= -0.0132563  |g|= 0.0104559  4 KF 25 JK
+macro= 7  E= -1962.83699706532  delta_E= -0.000302191  |g|= 0.00765254  3 KF 17 JK
+macro= 8  E= -1962.83707826715  delta_E= -8.12018e-05  |g|= 0.00228355  3 KF 17 JK
+macro= 9  E= -1962.83709530135  delta_E= -1.70342e-05  |g|= 0.00122443  3 KF 18 JK
+macro= 10  E= -1962.83709556553  delta_E= -2.64182e-07  |g|= 1.83147e-05  4 KF 32 JK
+macro= 11  E= -1962.83709556553  delta_E= 4.54747e-13  |g|= 1.2216e-05  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 12  E=-1962.83709556553  |g|= 1.2216e-05  total 38 KF 215 JK
+converged SCF energy = -1962.83709556553  <S^2> = 1.4416541  2S+1 = 2.6012721
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.00431076 0.01114202 0.01754951]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=minao  E=-1962.8370955655337  converged=True  internal_stable=True  <S^2>=1.4416540887291518
+Spherically averaged atomic HF for {'O', 'B', 'Al', 'Ni', 'H', 'F'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpyc8x5moo
+max_memory 22528 MB (current use 177 MB)
+atom = Ni
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1500.07780538092
+cycle= 1 E= -1498.41358823852  delta_E= 1.66  |g|=    0  |ddm|= 2.53
+cycle= 2 E= -1497.23543036837  delta_E= 1.18  |g|=    0  |ddm|= 3.91
+cycle= 3 E= -1500.36748346002  delta_E= -3.13  |g|=    0  |ddm|= 2.51
+cycle= 4 E= -1500.38318041546  delta_E= -0.0157  |g|=    0  |ddm|= 0.15
+cycle= 5 E= -1500.38318938786  delta_E= -8.97e-06  |g|=    0  |ddm|= 0.0137
+cycle= 6 E= -1500.38319486514  delta_E= -5.48e-06  |g|=    0  |ddm|= 0.00368
+cycle= 7 E= -1500.38319494626  delta_E= -8.11e-08  |g|=    0  |ddm|= 0.000417
+cycle= 8 E= -1500.38319494629  delta_E= -2.61e-11  |g|=    0  |ddm|= 1.76e-05
+Extra cycle  E= -1500.38319494627  delta_E= 1.59e-11  |g|=    0  |ddm|= 9.62e-06
+Atomic HF for atom  Ni  converged. SCF energy = -1500.38319494627
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpll3rhtl5
+max_memory 22528 MB (current use 187 MB)
+atom = Al
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -241.668087289344
+cycle= 1 E= -241.687968417748  delta_E= -0.0199  |g|=    0  |ddm|= 0.325
+cycle= 2 E= -241.688245372538  delta_E= -0.000277  |g|=    0  |ddm|= 0.057
+cycle= 3 E= -241.688250248134  delta_E= -4.88e-06  |g|=    0  |ddm|= 0.00413
+cycle= 4 E= -241.688250423851  delta_E= -1.76e-07  |g|=    0  |ddm|= 0.00252
+cycle= 5 E= -241.688250424075  delta_E= -2.24e-10  |g|=    0  |ddm|= 3.12e-05
+Extra cycle  E= -241.688250424076  delta_E= -5.97e-13  |g|=    0  |ddm|= 3.33e-06
+Atomic HF for atom  Al  converged. SCF energy = -241.688250424076
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpg8p1vzf7
+max_memory 22528 MB (current use 187 MB)
+atom = F
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -99.0019125646342
+cycle= 1 E= -99.0181269225426  delta_E= -0.0162  |g|=    0  |ddm|= 0.0221
+cycle= 2 E= -99.0181530578313  delta_E= -2.61e-05  |g|=    0  |ddm|= 0.00979
+cycle= 3 E= -99.0181583536781  delta_E= -5.3e-06  |g|=    0  |ddm|= 0.00307
+cycle= 4 E= -99.0181583977613  delta_E= -4.41e-08  |g|=    0  |ddm|= 0.000434
+cycle= 5 E= -99.0181583977685  delta_E= -7.15e-12  |g|=    0  |ddm|= 4.82e-06
+Extra cycle  E= -99.0181583977685  delta_E= -5.68e-14  |g|=    0  |ddm|= 1.59e-09
+Atomic HF for atom  F  converged. SCF energy = -99.0181583977685
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpy4cc27hx
+max_memory 22528 MB (current use 187 MB)
+atom = O
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -74.2519230269789
+cycle= 1 E= -74.264410576848  delta_E= -0.0125  |g|=    0  |ddm|= 0.119
+cycle= 2 E= -74.264762174806  delta_E= -0.000352  |g|=    0  |ddm|= 0.0426
+cycle= 3 E= -74.2648138999563  delta_E= -5.17e-05  |g|=    0  |ddm|= 0.0108
+cycle= 4 E= -74.2648159267533  delta_E= -2.03e-06  |g|=    0  |ddm|= 0.0029
+cycle= 5 E= -74.2648159267565  delta_E= -3.2e-12  |g|=    0  |ddm|= 2.32e-06
+Extra cycle  E= -74.2648159267565  delta_E= -2.84e-14  |g|=    0  |ddm|= 4.54e-08
+Atomic HF for atom  O  converged. SCF energy = -74.2648159267565
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmp9uzpx6v7
+max_memory 22528 MB (current use 187 MB)
+atom = B
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -24.3400682498297
+cycle= 1 E= -24.3712125312467  delta_E= -0.0311  |g|=    0  |ddm|= 0.341
+cycle= 2 E= -24.3726118872728  delta_E= -0.0014  |g|=    0  |ddm|= 0.0956
+cycle= 3 E= -24.3726774308189  delta_E= -6.55e-05  |g|=    0  |ddm|= 0.0128
+cycle= 4 E= -24.3726783184071  delta_E= -8.88e-07  |g|=    0  |ddm|= 0.00353
+cycle= 5 E= -24.3726783186678  delta_E= -2.61e-10  |g|=    0  |ddm|= 2.23e-05
+Extra cycle  E= -24.3726783186678  delta_E= -6.04e-14  |g|=    0  |ddm|= 6.22e-07
+Atomic HF for atom  B  converged. SCF energy = -24.3726783186678
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+
+======================================================================
+  UHF   AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.atom   charge=0  2S=1  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: atom
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.atom
+max_memory 22528 MB (current use 187 MB)
+number electrons alpha = 34  beta = 33
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.atom
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 22528 MB (current use 187 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 34  HOMO = -0.101633395523349  LUMO = -0.0692806627020293
+  beta  nocc = 33  HOMO = -0.245154697937833  LUMO = -0.101633395523349
+
+WARN: HOMO -0.101633395523349 >= LUMO -0.101633395523349
+
+Initial guess E= -1962.5729057167  |g|= 0.699671
+macro= 0  E= -1962.8025135823  delta_E= -0.229608  |g|= 0.144579  4 KF 19 JK
+macro= 1  E= -1962.82829778633  delta_E= -0.0257842  |g|= 0.0580431  3 KF 13 JK
+macro= 2  E= -1962.83559903653  delta_E= -0.00730125  |g|= 0.0627794  2 KF 8 JK
+macro= 3  E= -1962.83706462009  delta_E= -0.00146558  |g|= 0.00236742  5 KF 28 JK
+macro= 4  E= -1962.83709546542  delta_E= -3.08453e-05  |g|= 0.000621158  4 KF 30 JK
+macro= 5  E= -1962.83709556572  delta_E= -1.00304e-07  |g|= 1.45697e-05  3 KF 25 JK
+macro= 6  E= -1962.83709556572  delta_E= 2.72848e-12  |g|= 9.16661e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 7  E=-1962.83709556572  |g|= 9.16661e-06  total 23 KF 133 JK
+converged SCF energy = -1962.83709556572  <S^2> = 1.441667  2S+1 = 2.601282
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.00444108 0.01113392 0.01752104]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=atom  E=-1962.8370955657215  converged=True  internal_stable=True  <S^2>=1.4416670020965725
+Initial guess from on-the-fly Huckel, doi:10.1021/acs.jctc.8b01089.
+Spherically averaged atomic HF for {'O', 'B', 'Al', 'Ni', 'H', 'F'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmp4jra39ku
+max_memory 22528 MB (current use 229 MB)
+atom = Ni
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1500.07780538092
+cycle= 1 E= -1498.41358823852  delta_E= 1.66  |g|=    0  |ddm|= 2.53
+cycle= 2 E= -1497.23543036837  delta_E= 1.18  |g|=    0  |ddm|= 3.91
+cycle= 3 E= -1500.36748346002  delta_E= -3.13  |g|=    0  |ddm|= 2.51
+cycle= 4 E= -1500.38318041547  delta_E= -0.0157  |g|=    0  |ddm|= 0.15
+cycle= 5 E= -1500.38318938786  delta_E= -8.97e-06  |g|=    0  |ddm|= 0.0137
+cycle= 6 E= -1500.38319486514  delta_E= -5.48e-06  |g|=    0  |ddm|= 0.00368
+cycle= 7 E= -1500.38319494626  delta_E= -8.11e-08  |g|=    0  |ddm|= 0.000417
+cycle= 8 E= -1500.38319494629  delta_E= -2.71e-11  |g|=    0  |ddm|= 1.76e-05
+Extra cycle  E= -1500.38319494627  delta_E= 1.96e-11  |g|=    0  |ddm|= 9.62e-06
+Atomic HF for atom  Ni  converged. SCF energy = -1500.38319494627
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpe67f7il8
+max_memory 22528 MB (current use 229 MB)
+atom = Al
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -241.668087289345
+cycle= 1 E= -241.687968417748  delta_E= -0.0199  |g|=    0  |ddm|= 0.325
+cycle= 2 E= -241.688245372538  delta_E= -0.000277  |g|=    0  |ddm|= 0.057
+cycle= 3 E= -241.688250248134  delta_E= -4.88e-06  |g|=    0  |ddm|= 0.00413
+cycle= 4 E= -241.688250423851  delta_E= -1.76e-07  |g|=    0  |ddm|= 0.00252
+cycle= 5 E= -241.688250424075  delta_E= -2.24e-10  |g|=    0  |ddm|= 3.12e-05
+Extra cycle  E= -241.688250424076  delta_E= -6.25e-13  |g|=    0  |ddm|= 3.33e-06
+Atomic HF for atom  Al  converged. SCF energy = -241.688250424076
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpc6gf4yg6
+max_memory 22528 MB (current use 229 MB)
+atom = F
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -99.0019125646342
+cycle= 1 E= -99.0181269225426  delta_E= -0.0162  |g|=    0  |ddm|= 0.0221
+cycle= 2 E= -99.0181530578313  delta_E= -2.61e-05  |g|=    0  |ddm|= 0.00979
+cycle= 3 E= -99.0181583536781  delta_E= -5.3e-06  |g|=    0  |ddm|= 0.00307
+cycle= 4 E= -99.0181583977613  delta_E= -4.41e-08  |g|=    0  |ddm|= 0.000434
+cycle= 5 E= -99.0181583977685  delta_E= -7.16e-12  |g|=    0  |ddm|= 4.82e-06
+Extra cycle  E= -99.0181583977685  delta_E= -2.84e-14  |g|=    0  |ddm|= 1.59e-09
+Atomic HF for atom  F  converged. SCF energy = -99.0181583977685
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpr0n2js90
+max_memory 22528 MB (current use 229 MB)
+atom = O
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -74.2519230269789
+cycle= 1 E= -74.264410576848  delta_E= -0.0125  |g|=    0  |ddm|= 0.119
+cycle= 2 E= -74.264762174806  delta_E= -0.000352  |g|=    0  |ddm|= 0.0426
+cycle= 3 E= -74.2648138999563  delta_E= -5.17e-05  |g|=    0  |ddm|= 0.0108
+cycle= 4 E= -74.2648159267533  delta_E= -2.03e-06  |g|=    0  |ddm|= 0.0029
+cycle= 5 E= -74.2648159267565  delta_E= -3.15e-12  |g|=    0  |ddm|= 2.32e-06
+Extra cycle  E= -74.2648159267565  delta_E= -2.84e-14  |g|=    0  |ddm|= 4.54e-08
+Atomic HF for atom  O  converged. SCF energy = -74.2648159267565
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmp_lplbrsz
+max_memory 22528 MB (current use 229 MB)
+atom = B
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -24.3400682498297
+cycle= 1 E= -24.3712125312467  delta_E= -0.0311  |g|=    0  |ddm|= 0.341
+cycle= 2 E= -24.3726118872728  delta_E= -0.0014  |g|=    0  |ddm|= 0.0956
+cycle= 3 E= -24.3726774308189  delta_E= -6.55e-05  |g|=    0  |ddm|= 0.0128
+cycle= 4 E= -24.3726783184071  delta_E= -8.88e-07  |g|=    0  |ddm|= 0.00353
+cycle= 5 E= -24.3726783186678  delta_E= -2.61e-10  |g|=    0  |ddm|= 2.23e-05
+Extra cycle  E= -24.3726783186678  delta_E= -4.62e-14  |g|=    0  |ddm|= 6.22e-07
+Atomic HF for atom  B  converged. SCF energy = -24.3726783186678
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+  alpha nocc = 34  HOMO = 0.00894780447388743  LUMO = 0.0230438871201784
+  beta  nocc = 33  HOMO = -0.0975289596274584  LUMO = 0.00894780447388743
+
+WARN: HOMO 0.00894780447388743 >= LUMO 0.00894780447388743
+
+
+======================================================================
+  UHF   AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.huckel   charge=0  2S=1  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: huckel
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.huckel
+max_memory 22528 MB (current use 229 MB)
+number electrons alpha = 34  beta = 33
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.huckel
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 22528 MB (current use 229 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 34  HOMO = -0.371449943280762  LUMO = -0.0679621527095664
+  beta  nocc = 33  HOMO = -0.379353094483753  LUMO = -0.131969242118952
+  HOMO = -0.371449943281  LUMO = -0.131969242119  gap/eV = 6.51660
+Initial guess E= -1962.58635262921  |g|= 0.513976
+macro= 0  E= -1962.76433283438  delta_E= -0.17798  |g|= 0.109578  4 KF 18 JK
+macro= 1  E= -1962.83039997061  delta_E= -0.0660671  |g|= 0.0639115  3 KF 12 JK
+macro= 2  E= -1962.83777857461  delta_E= -0.0073786  |g|= 0.0536037  2 KF 8 JK
+macro= 3  E= -1962.84077152539  delta_E= -0.00299295  |g|= 0.0182288  3 KF 15 JK
+macro= 4  E= -1962.84342898307  delta_E= -0.00265746  |g|= 0.0550089  2 KF 8 JK
+macro= 5  E= -1962.84467286867  delta_E= -0.00124389  |g|= 0.0256385  2 KF 8 JK
+macro= 6  E= -1962.84503124571  delta_E= -0.000358377  |g|= 0.00411077  3 KF 14 JK
+macro= 7  E= -1962.84504886756  delta_E= -1.76218e-05  |g|= 2.57093e-05  4 KF 29 JK
+macro= 8  E= -1962.84504886756  delta_E= 9.09495e-13  |g|= 6.87362e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 9  E=-1962.84504886756  |g|= 6.87362e-06  total 25 KF 124 JK
+converged SCF energy = -1962.84504886756  <S^2> = 1.7080789  2S+1 = 2.7986274
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.01381113 0.01660776 0.02051866]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=huckel  E=-1962.845048867563  converged=True  internal_stable=True  <S^2>=1.7080788563899532
+
+======================================================================
+  UHF   AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.rhfchk   charge=0  2S=1  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: rhfchk
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.rhfchk
+max_memory 22528 MB (current use 235 MB)
+number electrons alpha = 34  beta = 33
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.rhfchk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 22528 MB (current use 235 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 34  HOMO = -0.23511921643358  LUMO = 0.0462285940231686
+  beta  nocc = 33  HOMO = -0.309486158367942  LUMO = 0.0307828469552884
+  HOMO = -0.235119216434  LUMO = 0.0307828469553  gap/eV = 7.23556
+Initial guess E= -1962.77076846032  |g|= 0.0269675
+macro= 0  E= -1962.79106618781  delta_E= -0.0202977  |g|= 0.0269675  1 KF 6 JK
+macro= 1  E= -1962.82724137989  delta_E= -0.0361752  |g|= 0.083832  4 KF 20 JK
+macro= 2  E= -1962.83600715563  delta_E= -0.00876578  |g|= 0.0383982  3 KF 14 JK
+macro= 3  E= -1962.83708831046  delta_E= -0.00108115  |g|= 0.00284166  5 KF 27 JK
+macro= 4  E= -1962.83709554818  delta_E= -7.23772e-06  |g|= 0.000216559  4 KF 30 JK
+macro= 5  E= -1962.83709556394  delta_E= -1.57529e-08  |g|= 3.71482e-05  2 KF 7 JK
+macro= 6  E= -1962.83709556393  delta_E= 4.54747e-12  |g|= 1.13707e-05  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 7  E=-1962.83709556393  |g|= 1.13707e-05  total 21 KF 114 JK
+converged SCF energy = -1962.83709556393  <S^2> = 1.441524  2S+1 = 2.601172
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.00443238 0.01120626 0.01752997]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=rhfchk  E=-1962.8370955639307  converged=True  internal_stable=True  <S^2>=1.4415239888697897
+
+======================================================================
+  UHF   AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.current   charge=0  2S=1  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: current
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.current
+max_memory 22528 MB (current use 235 MB)
+number electrons alpha = 34  beta = 33
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e/AlBFH4NiO-d4769ef714beb370c739954164093fd731f43d3e.uhf.chk.current
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 22528 MB (current use 235 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 34  HOMO = -0.284651514389343  LUMO = 0.0504993998967826
+  beta  nocc = 33  HOMO = -0.382683668455035  LUMO = 0.0289169082814666
+  HOMO = -0.284651514389  LUMO = 0.0289169082815  gap/eV = 8.53263
+Initial guess E= -1962.84504884294  |g|= 1.49374e-05
+macro= 0  E= -1962.84504886033  delta_E= -1.73809e-08  |g|= 1.49374e-05  1 KF 5 JK
+macro= 1  E= -1962.84504886765  delta_E= -7.32507e-09  |g|= 9.96097e-05  1 KF 9 JK
+macro= 2  E= -1962.84504886765  delta_E= 4.54747e-13  |g|= 8.98547e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 3  E=-1962.84504886765  |g|= 8.98547e-06  total 4 KF 20 JK
+converged SCF energy = -1962.84504886765  <S^2> = 1.708072  2S+1 = 2.7986225
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.01382095 0.01662039 0.02051826]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=current  E=-1962.8450488676503  converged=True  internal_stable=True  <S^2>=1.708071969962532
