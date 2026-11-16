@@ -10,16 +10,19 @@
 #SBATCH --error=slurm_newton.err
 
 # ---------------------------------------------------------------------------
-# Newton-only SCF search over several initial guesses for the dz records that
-# are above the reference energy (see rerun_newton.py).  Only the lowest
-# solution per (system, method) is kept, in ./results_newton/<stem>/.
-# Finished records are skipped, so the job can be resubmitted.
-# Add --replace to EXTRA to copy the lower solutions over ./results/<stem>/.
+# Newton-only SCF for ALL systems, one calculation per initial guess
+# (minao, atom, huckel, rhfchk, current); see rerun_newton.py.
+# ./results_newton/<stem>/ keeps the chkfile of every guess and a copy of the
+# lowest one as <stem>.<method>.chk  (*.chk is not tracked by git).
+# Finished records are skipped, so the job can be resubmitted if it hits the
+# time limit.  Add --replace to EXTRA to copy solutions lower than the present
+# ones over ./results/<stem>/.
 #
 #   sbatch submit_newton_resnick.sbatch
 # ---------------------------------------------------------------------------
-NW=8            # systems at the same time
-EXTRA=""        # e.g. "--replace"
+NW_SMALL=16     # systems at the same time when the integrals fit in memory at this share
+NW_BIG=4        # systems at the same time for the larger ones
+EXTRA=""        # e.g. "--replace" or "--above-only"
 
 source /resnick/groups/sharmagroup/yichi/miniconda3/etc/profile.d/conda.sh
 conda activate pyscf
@@ -30,14 +33,30 @@ echo "Running on $(hostname) with $SLURM_CPUS_PER_TASK cores, ${SLURM_MEM_PER_NO
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs results_newton
 
-NT=$(( SLURM_CPUS_PER_TASK / NW ))
-export OMP_NUM_THREADS=$NT OPENBLAS_NUM_THREADS=$NT MKL_NUM_THREADS=$NT NUMEXPR_NUM_THREADS=$NT
-export MEM_MB=$(( SLURM_MEM_PER_NODE / NW * 8 / 10 )) EXTRA
+export EXTRA
 
-mapfile -t FILES < <(OMP_NUM_THREADS=1 python rerun_newton.py --list | awk '{print $1}')
-echo "${#FILES[@]} systems above the reference, $NW at a time, $NT threads and $MEM_MB MB each   start: $(date)"
-printf '%s\n' "${FILES[@]}" | xargs -P "$NW" -I{} bash -c \
-    'python rerun_newton.py --memory "$MEM_MB" $EXTRA "$1" > "logs/$(basename "$1" .xyz).newton.out" 2>&1' _ {}
+# same two tiers as submit_resnick.sbatch: NW systems at a time, each with
+# cpus/NW threads and an 80% share of the memory
+run_tier() {
+  local nw=$1; shift
+  [ $# -eq 0 ] && return
+  local nt=$(( SLURM_CPUS_PER_TASK / nw ))
+  export OMP_NUM_THREADS=$nt OPENBLAS_NUM_THREADS=$nt MKL_NUM_THREADS=$nt NUMEXPR_NUM_THREADS=$nt
+  export MEM_MB=$(( SLURM_MEM_PER_NODE / nw * 8 / 10 ))
+  echo "$(date)  $# systems, $nw at a time, $nt threads and $MEM_MB MB each"
+  printf '%s\n' "$@" | xargs -P "$nw" -I{} bash -c \
+      'python rerun_newton.py --memory "$MEM_MB" $EXTRA "$1" > "logs/$(basename "$1" .xyz).newton.out" 2>&1' _ {}
+}
+
+LIMIT=$(( SLURM_MEM_PER_NODE / NW_SMALL * 8 / 10 ))
+WANT=$(OMP_NUM_THREADS=1 python rerun_newton.py --list $EXTRA | awk '{print $1}' | xargs -n1 basename)
+SIZES=$(OMP_NUM_THREADS=1 python run_scf.py --sizes | grep -F -f <(echo "$WANT"))    # "<nao> <xyz file>", largest first
+mapfile -t BIG   < <(awk -v m="$LIMIT" '$1^4/1e6 + 500 >= 0.95*m {print $2}' <<< "$SIZES")
+mapfile -t SMALL < <(awk -v m="$LIMIT" '$1^4/1e6 + 500 <  0.95*m {print $2}' <<< "$SIZES")
+echo "$(( ${#BIG[@]} + ${#SMALL[@]} )) systems   start: $(date)"
+
+run_tier "$NW_BIG" "${BIG[@]}"
+run_tier "$NW_SMALL" "${SMALL[@]}"
 
 python rerun_newton.py --summary
 echo "done: $(date)"

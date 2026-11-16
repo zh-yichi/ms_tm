@@ -1,28 +1,28 @@
 #!/usr/bin/env python
-"""Second-order (Newton) SCF search for the systems whose dz energy is ABOVE the
-reference energy (sfX2C-1e / cc-pVDZ-DK).
+"""Second-order (Newton) SCF search over several initial guesses, for ALL systems
+(sfX2C-1e / cc-pVDZ-DK).  No DIIS anywhere.
 
-Targets: every (system, method) in ./results with dE_ref_mEh > --tol-mEh
-(the records listed as "... mEh ABOVE the reference energy" in results/problems.txt).
-
-For each target, one calculation per initial guess (--guesses):
+For every system and method (RHF/ROHF, UHF), one calculation per initial guess (--guesses):
     minao, atom, huckel, ...   pyscf initial guesses
-    rhfchk  (UHF only)         RHF/ROHF orbitals of the same system (the one found by
-                               this script if RHF was a target too, else ./results)
-    current                    orbitals of the present ./results solution
-Each calculation uses the Newton solver only (no DIIS):
+    rhfchk  (UHF only)         RHF/ROHF orbitals of the same system (the lowest one found
+                               by this script, else the one in ./results)
+    current                    orbitals of the present ./results solution (if there is one)
+Each calculation:
     Newton SCF -> internal stability analysis -> if unstable, step along the lowest
     Hessian eigenvector in BOTH directions (+v and -v), re-converge both with Newton
     and keep the lower one -> repeat until stable.
-Only the lowest solution over all guesses is kept (stable ones are preferred):
 
-    results_newton/<stem>/<stem>.<method>.chk     orbitals of the lowest solution
-    results_newton/<stem>/<stem>.<method>.json    its record + the energy of every guess
-    results_newton/<stem>/<stem>.newton.log       pyscf output of all calculations
+Output in results_newton/<stem>/ :
+    <stem>.<method>.<guess>.chk   orbitals of EVERY guess (all are kept)
+    <stem>.<method>.chk           copy of the lowest one (stable solutions are preferred);
+                                  same name as in ./results, so tz can start from this folder
+    <stem>.<method>.json          record of the lowest one + energy, <S^2>, chkfile of every guess
+    <stem>.newton.log             pyscf output of all calculations
 
-  python rerun_newton.py                  # all targets (finished ones are skipped)
-  python rerun_newton.py --list           # only print the targets (xyz file and methods)
+  python rerun_newton.py                  # all systems (finished ones are skipped)
   python rerun_newton.py a.xyz b.xyz      # only these systems (stems or xyz files)
+  python rerun_newton.py --above-only     # only records of ./results above the reference energy
+  python rerun_newton.py --list           # only print "<xyz file> <methods>" of what would run
   python rerun_newton.py --replace        # also copy a solution that is lower than the
                                           # present one over ./results/<stem>/ (json + chk)
   python rerun_newton.py --summary        # table of what was found
@@ -178,20 +178,31 @@ def run_guess(mol, method, guess, dm0, chk, logfile, a):
     return rec
 
 
-def find_targets(resdir, tol_mEh, only, methods):
-    """{stem: {method: present record}} for the records above the reference energy."""
+def find_targets(a, only, methods):
+    """{stem: (xyz paths, {method: {'old': present record or None, 'ref': reference entry or None}})}"""
+    ref = load_json(a.reference) or {}
+    uniq = {}       # identical files appear in several subfolders
+    for f in sorted(glob.glob(os.path.join(a.xyzdir, '*', '*.xyz'))):
+        uniq.setdefault(os.path.splitext(os.path.basename(f))[0], []).append(os.path.abspath(f))
     out = {}
-    for f in sorted(glob.glob(os.path.join(resdir, '*', '*.json'))):
-        r = json.load(open(f))
-        if r.get('method') not in methods or (only and r['name'] not in only):
+    for stem, paths in uniq.items():
+        if only and stem not in only:
             continue
-        d = r.get('dE_ref_mEh')
-        if (d is not None and d > tol_mEh) or (only and d is None):
-            out.setdefault(r['name'], {})[r['method']] = r
+        todo = {}
+        for m in methods:
+            old = load_json(os.path.join(a.resdir, stem, '%s.%s.json' % (stem, m)))
+            if a.above_only and not only:
+                d = (old or {}).get('dE_ref_mEh')
+                if d is None or d <= a.tol_mEh:
+                    continue
+            todo[m] = {'old': old or {}, 'ref': ref.get(stem, {}).get(m) or {}}
+        if todo:
+            out[stem] = (paths, todo)
     return out
 
 
 def summary(outdir):
+    f3 = lambda v: 'n/a' if v is None else '%.3f' % v
     rows = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(outdir, '*', '*.json')))]
     print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
         'system', 'meth', 'guess', 'E', 'dE_ref/mEh', 'dE_old/mEh', '<S^2>', 'stable', 'all guesses: E - E_lowest (mEh)'))
@@ -202,20 +213,35 @@ def summary(outdir):
         print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
             r['name'][:22], r['method'], r.get('init_guess'), f(r.get('energy'), '%.8f'), f(r.get('dE_ref_mEh')),
             f(r.get('dE_prev_mEh')), f(r.get('s2'), '%.3f'), r.get('internal_stable'), cand))
-    n = sum(1 for r in rows if r.get('dE_ref_mEh') is not None and r['dE_ref_mEh'] <= E_TOL * 1e3)
-    print('%d records, %d at or below the reference energy' % (len(rows), n))
+    d = [r['dE_ref_mEh'] for r in rows if r.get('dE_ref_mEh') is not None]
+    t = E_TOL * 1e3
+    print('%d records: %d not converged, vs the reference energy: %d same, %d below, %d above, %d without reference' % (
+        len(rows), sum(1 for r in rows if r.get('energy') is None), sum(1 for x in d if abs(x) <= t),
+        sum(1 for x in d if x < -t), sum(1 for x in d if x > t), len(rows) - len(d)))
+    for r in rows:
+        if r.get('dE_ref_mEh') is not None and abs(r['dE_ref_mEh']) > t:
+            print('   %-50s %-4s %+10.4f mEh  <S^2> %s (reference %s)' % (r['name'][:50], r['method'], r['dE_ref_mEh'],
+                  f3(r.get('s2')), f3(r.get('ref_s2'))))
+    lo = {(r['name'], r['method']): r.get('energy') for r in rows}
+    for (n_, m), e in sorted(lo.items()):
+        er = lo.get((n_, 'rhf'))
+        if m == 'uhf' and e is not None and er is not None and e > er + 1e-6:
+            print('   %-50s UHF is %.4f mEh ABOVE RHF/ROHF' % (n_[:50], (e - er) * 1e3))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('systems', nargs='*', help='stems or xyz files (default: all records above the reference)')
+    ap.add_argument('systems', nargs='*', help='stems or xyz files (default: all under --xyzdir)')
+    ap.add_argument('--above-only', action='store_true',
+                    help='only the records of --resdir that are more than --tol-mEh above the reference')
+    ap.add_argument('--reference', default=os.path.join(here, 'reference.json'))
     ap.add_argument('--xyzdir', default=os.path.join(here, '..', 'xyzfiles'))
     ap.add_argument('--resdir', default=os.path.join(here, 'results'), help='present dz results')
     ap.add_argument('--outdir', default=os.path.join(here, 'results_newton'))
     ap.add_argument('--methods', default='rhf,uhf')
     ap.add_argument('--guesses', default='minao,atom,huckel,rhfchk,current')
     ap.add_argument('--tol-mEh', type=float, default=E_TOL * 1e3,
-                    help='rerun records more than this above the reference (default %(default)s)')
+                    help='threshold of --above-only (default %(default)s)')
     ap.add_argument('--conv-tol', type=float, default=1e-9)
     ap.add_argument('--newton-max-cycle', type=int, default=200)
     ap.add_argument('--max-stab', type=int, default=15)
@@ -226,7 +252,7 @@ def main():
     ap.add_argument('--force', action='store_true', help='rerun even if the json exists')
     ap.add_argument('--replace', action='store_true',
                     help='copy solutions lower than the present one over <resdir>/<stem>/ (json and chk)')
-    ap.add_argument('--list', action='store_true', help='only print "<xyz file> <methods>" of the targets')
+    ap.add_argument('--list', action='store_true', help='only print "<xyz file> <methods>" of what would run')
     ap.add_argument('--summary', action='store_true', help='only print the table of results_newton')
     a = ap.parse_args()
     if a.summary:
@@ -234,34 +260,38 @@ def main():
         return
 
     only = {os.path.splitext(os.path.basename(s))[0] for s in a.systems}
-    targets = find_targets(a.resdir, a.tol_mEh, only, a.methods.split(','))
-    xyz = {s: sorted(glob.glob(os.path.join(a.xyzdir, '*', s + '.xyz'))) for s in targets}
+    targets = find_targets(a, only, a.methods.split(','))
     if a.list:
-        for s in targets:
-            print(xyz[s][0], ','.join(sorted(targets[s])))
+        for s, (paths, todo) in targets.items():
+            print(paths[0], ','.join(sorted(todo)))
         return
-    print('threads:', lib.num_threads(), ' targets:', sum(len(v) for v in targets.values()),
+    print('threads:', lib.num_threads(), ' targets:', sum(len(v[1]) for v in targets.values()),
           'records in', len(targets), 'systems', flush=True)
 
-    for stem, todo in targets.items():
+    for stem, (paths, todo) in targets.items():
         sysdir = os.path.join(a.outdir, stem)
         jf = lambda m, d=sysdir: os.path.join(d, '%s.%s.json' % (stem, m))
         chk = lambda m, d=sysdir: os.path.join(d, '%s.%s.chk' % (stem, m))
         olddir = os.path.join(a.resdir, stem)
-        methods = [m for m in ('rhf', 'uhf') if m in todo and (a.force or not os.path.exists(jf(m)))]
+        gchk = lambda m, g, d=sysdir: os.path.join(d, '%s.%s.%s.chk' % (stem, m, g))
+        # done = json written by this version (it lists the chkfile of every guess)
+        done = lambda m: (load_json(jf(m)) or {}).get('all_chk_saved') is True
+        methods = [m for m in ('rhf', 'uhf') if m in todo and (a.force or not done(m))]
         if not methods:
             print('skip (done):', stem, flush=True)
             continue
         os.makedirs(sysdir, exist_ok=True)
         logf = os.path.join(sysdir, '%s.newton.log' % stem)
-        mol = build_mol(xyz[stem][0], BASIS, logf, a.memory)
+        mol = build_mol(paths[0], BASIS, logf, a.memory)
         for method in methods:          # rhf first: its orbitals are the 'rhfchk' guess of uhf
-            t0, old = time.time(), todo[method]
+            t0, old, ref = time.time(), todo[method]['old'], todo[method]['ref']
             own_rhf = load_json(jf('rhf'))
             rhf_chk = chk('rhf') if (own_rhf and own_rhf.get('converged')) else chk('rhf', olddir)
-            cands, best, tmp_best = [], None, chk(method) + '.best'
+            cands, best = [], None
             for guess in a.guesses.split(','):
-                tmp = chk(method) + '.' + guess
+                if guess == 'rhfchk' and method == 'rhf':
+                    continue
+                tmp = gchk(method, guess)
                 try:
                     dm0 = start_density(mol, new_mf(mol, method), method, guess, rhf_chk, chk(method, olddir))
                     if dm0 is None:
@@ -272,6 +302,7 @@ def main():
                     traceback.print_exc()
                     rec = {'guess': guess, 'converged': False, 'energy': None, 'internal_stable': None,
                            's2': None, 'note': ['ERROR: %r' % ex]}
+                rec['chkfile'] = tmp if os.path.exists(tmp) else None
                 cands.append(rec)
                 print('  %-22s %-4s %-8s E=%-18s conv=%-5s stab_i=%-5s <S^2>=%-7s %s' % (
                     stem[:22], method, guess, rec['energy'], rec['converged'], rec['internal_stable'],
@@ -282,25 +313,23 @@ def main():
                                                   and not (key(rec)[0] == key(best)[0]
                                                            and rec['energy'] > best['energy'] - TIE)):
                     best = rec
-                    shutil.move(tmp, tmp_best)
-                elif os.path.exists(tmp):
-                    os.remove(tmp)
             out = dict(best) if best else {'converged': False, 'energy': None, 'internal_stable': None,
                                            'note': ['no guess converged']}
             out['note'] = list(out.get('note', []))
             out.update(method=method, name=stem, init_guess=out.pop('guess', None), solver='newton',
+                       all_chk_saved=True, lowest_chkfile=(best or {}).get('chkfile'),
                        start='newton:%s' % (best['guess'] if best else None),
                        candidates=[{k: c.get(k) for k in ('guess', 'energy', 's2', 'converged', 'internal_stable',
-                                                          'stab_rounds', 'note')} for c in cands],
-                       ref_energy=old.get('ref_energy'), ref_s2=old.get('ref_s2'), prev_energy=old.get('energy'),
-                       prev_s2=old.get('s2'), xyz=xyz[stem], charge=old.get('charge'), mult=old.get('mult'),
-                       subdirs=old.get('subdirs'), basis=BASIS, x2c=True, nao=mol.nao, nelec=mol.nelec,
+                                                          'stab_rounds', 'note', 'chkfile')} for c in cands],
+                       ref_energy=ref.get('energy'), ref_s2=ref.get('s2'), prev_energy=old.get('energy'),
+                       prev_s2=old.get('s2'), xyz=paths, charge=mol.charge, mult=mol.spin + 1,
+                       subdirs=[os.path.basename(os.path.dirname(p)) for p in paths], basis=BASIS, x2c=True, nao=mol.nao, nelec=mol.nelec,
                        chkfile=chk(method), logfile=logf, conv_tol=a.conv_tol,
                        newton_max_cycle=a.newton_max_cycle, max_stab=a.max_stab, stab_tol=a.stab_tol,
                        time_s=round(time.time() - t0, 1))
             if best:
-                shutil.move(tmp_best, chk(method))
-                for k, e0 in (('dE_ref_mEh', old.get('ref_energy')), ('dE_prev_mEh', old.get('energy'))):
+                shutil.copy(best['chkfile'], chk(method))
+                for k, e0 in (('dE_ref_mEh', ref.get('energy')), ('dE_prev_mEh', old.get('energy'))):
                     out[k] = None if e0 is None else (best['energy'] - e0) * 1e3
                 if out['dE_ref_mEh'] is not None and abs(out['dE_ref_mEh']) > E_TOL * 1e3:
                     out['note'].append('%+.4f mEh relative to the reference energy' % out['dE_ref_mEh'])
