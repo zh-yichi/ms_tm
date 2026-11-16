@@ -104,7 +104,7 @@ def run_guess(mol, method, guess, dm0, chk, logfile, a):
     """Newton SCF + stability following (both directions) from one initial density."""
     log = logger.new_logger(mol, VERBOSE)
     log.note('\n' + '=' * 70 + '\n  %s   %s   charge=%d  2S=%d  basis=%s  sfX2C-1e   NEWTON   guess: %s\n'
-             % (method.upper(), os.path.basename(chk), mol.charge, mol.spin, BASIS, guess) + '=' * 70)
+             % (method.upper(), os.path.basename(chk), mol.charge, mol.spin, mol.basis, guess) + '=' * 70)
     is_rohf = (method == 'rhf' and mol.spin > 0)
     external = a.external == 'on' and not is_rohf
     rec = {'guess': guess, 'converged': False, 'internal_stable': None, 'external_stable': None,
