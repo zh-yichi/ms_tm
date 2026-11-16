@@ -1,0 +1,1813 @@
+#INFO: **** input file is /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/rerun_newton.py ****
+#!/usr/bin/env python
+"""Second-order (Newton) SCF search over several initial guesses, for ALL systems
+(sfX2C-1e / cc-pVDZ-DK).  No DIIS anywhere.
+
+For every system and method (RHF/ROHF, UHF), one calculation per initial guess (--guesses):
+    minao, atom, huckel, ...   pyscf initial guesses
+    rhfchk  (UHF only)         RHF/ROHF orbitals of the same system (the lowest one found
+                               by this script, else the one in ./results)
+    current                    orbitals of the present ./results solution (if there is one)
+Each calculation:
+    Newton SCF -> internal stability analysis -> if unstable, step along the lowest
+    Hessian eigenvector in BOTH directions (+v and -v), re-converge both with Newton
+    and keep the lower one -> repeat until stable.
+
+Output in results_newton/<stem>/ :
+    <stem>.<method>.<guess>.chk   orbitals of EVERY guess (all are kept)
+    <stem>.<method>.chk           copy of the lowest one (stable solutions are preferred);
+                                  same name as in ./results, so tz can start from this folder
+    <stem>.<method>.json          record of the lowest one + energy, <S^2>, chkfile of every guess
+    <stem>.newton.log             pyscf output of all calculations
+
+  python rerun_newton.py                  # all systems (finished ones are skipped)
+  python rerun_newton.py a.xyz b.xyz      # only these systems (stems or xyz files)
+  python rerun_newton.py --above-only     # only records of ./results above the reference energy
+  python rerun_newton.py --list           # only print "<xyz file> <methods>" of what would run
+  python rerun_newton.py --replace        # also copy a solution that is lower than the
+                                          # present one over ./results/<stem>/ (json + chk)
+  python rerun_newton.py --summary        # table of what was found
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import sys
+import time
+import traceback
+
+import numpy as np
+
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(here, '..'))
+from pyscf import scf, lib
+from pyscf.lib import logger
+from scf_lowest import (parse_xyz, build_mol, _stability_with_eigs, dm_from_rhf_chk,
+                        load_json, VERBOSE, E_TOL)
+
+BASIS = 'cc-pvdz-dk'
+TIE = 1e-7      # Eh; energies closer than this are the same solution
+
+
+def new_mf(mol, method):
+    return (scf.RHF(mol) if method == 'rhf' else scf.UHF(mol)).x2c()   # RHF -> ROHF if mol.spin > 0
+
+
+def newton(mf, chk, conv_tol, max_cycle, dm0=None, mo=None, occ=None):
+    """Newton SCF from a density matrix or from orbitals.  Returns a state dict."""
+    nmf = mf.newton()
+    nmf.chkfile = chk
+    nmf.max_cycle = max_cycle
+    nmf.conv_tol = conv_tol
+    if mo is not None:
+        nmf.kernel(np.asarray(mo), np.asarray(occ))
+    else:
+        nmf.kernel(dm0=dm0)
+    return dict(mo_coeff=nmf.mo_coeff, mo_energy=nmf.mo_energy, mo_occ=nmf.mo_occ,
+                e_tot=float(nmf.e_tot), converged=bool(nmf.converged))
+
+
+def set_state(mf, s):
+    mf.mo_coeff, mf.mo_energy, mf.mo_occ = s['mo_coeff'], s['mo_energy'], s['mo_occ']
+    mf.e_tot, mf.converged = s['e_tot'], s['converged']
+    return mf
+
+
+def opposite_step(mo0, mo1, ovlp):
+    """mo1 = mo0.U (pyscf's step along +v).  Returns mo0.U^T, the step along -v."""
+    mo0, mo1 = np.asarray(mo0), np.asarray(mo1)
+    if mo0.ndim == 3:
+        return np.array([opposite_step(a, b, ovlp) for a, b in zip(mo0, mo1)])
+    u = mo0.T.dot(ovlp).dot(mo1)
+    return mo0.dot(u.T)
+
+
+def start_density(mol, mf, method, guess, rhf_chk, cur_chk):
+    """Initial density matrix for this guess, or None if it is not available."""
+    if guess == 'rhfchk':
+        if method != 'uhf' or not (rhf_chk and os.path.exists(rhf_chk)):
+            return None
+        dm0 = dm_from_rhf_chk(rhf_chk)
+    elif guess == 'current':
+        if not (cur_chk and os.path.exists(cur_chk)):
+            return None
+        return mf.from_chk(cur_chk)
+    else:
+        dm0 = np.asarray(mf.get_init_guess(key=guess))
+    if method == 'uhf' and mol.spin == 0:
+        # break alpha/beta symmetry so that singlets can relax to a spin-polarized solution
+        dm0 = np.array([dm0[0] * 1.05, dm0[1] * 0.95])
+    return dm0
+
+
+def run_guess(mol, method, guess, dm0, chk, logfile, a):
+    """Newton SCF + stability following (both directions) from one initial density."""
+    log = logger.new_logger(mol, VERBOSE)
+    log.note('\n' + '=' * 70 + '\n  %s   %s   charge=%d  2S=%d  basis=%s  sfX2C-1e   NEWTON   guess: %s\n'
+             % (method.upper(), os.path.basename(chk), mol.charge, mol.spin, BASIS, guess) + '=' * 70)
+    is_rohf = (method == 'rhf' and mol.spin > 0)
+    external = a.external == 'on' and not is_rohf
+    rec = {'guess': guess, 'converged': False, 'internal_stable': None, 'external_stable': None,
+           'stab_rounds': 0, 'stab_eigs': [], 'energy': None, 's2': None, 'note': []}
+    mf = new_mf(mol, method)
+    mf.chkfile = chk
+    mf.conv_tol = a.conv_tol
+    ovlp = mf.get_ovlp()
+    state = newton(mf, chk, a.conv_tol, a.newton_max_cycle, dm0=dm0)
+    set_state(mf, state)
+    if not state['converged']:
+        rec['note'].append('Newton SCF NOT CONVERGED')
+
+    stable_i = stable_e = None
+    for it in range(a.max_stab + 1):
+        if not mf.converged:
+            break
+        log.note('--- stability analysis, round %d ---', it)
+        mo_i, mo_e, stable_i, stable_e, eigs = _stability_with_eigs(mf, logfile, True, external)
+        if not external:
+            stable_e = None
+        rec['stab_eigs'].append(eigs)
+        vals = [v for k, v in eigs.items() if k.endswith('_internal') and v is not None]
+        if (not stable_i) and vals and min(vals) > -a.stab_tol:
+            rec['note'].append('internal eig %.1e within stab_tol, treated as stable' % min(vals))
+            stable_i = True
+        if stable_i or it == a.max_stab:
+            break
+        rec['stab_rounds'] += 1
+        e_old, tried = state['e_tot'], []
+        for sign, mo in (('+v', mo_i), ('-v', opposite_step(state['mo_coeff'], mo_i, ovlp))):
+            log.note('internal instability -> step along %s and Newton SCF', sign)
+            try:
+                s = newton(mf, chk, a.conv_tol, a.newton_max_cycle, mo=mo, occ=state['mo_occ'])
+            except Exception as ex:
+                log.note('step %s failed: %r', sign, ex)
+                continue
+            log.note('step %s: E = %.10f  converged = %s', sign, s['e_tot'], s['converged'])
+            if s['converged']:
+                tried.append(s)
+        set_state(mf, state)
+        if not tried:
+            rec['note'].append('Newton SCF NOT CONVERGED after following the instability; kept the unstable solution')
+            break
+        best = min(tried, key=lambda s: s['e_tot'])
+        if best['e_tot'] > e_old - 1e-8:
+            log.note('neither direction lowered the energy (%.10f): zero mode, stop', e_old)
+            rec['note'].append('instability following did not lower E; zero mode, treated as stable')
+            stable_i = True
+            break
+        state = best
+        set_state(mf, state)
+
+    rec['converged'] = bool(mf.converged)
+    rec['internal_stable'] = None if stable_i is None else bool(stable_i)
+    rec['external_stable'] = None if stable_e is None else bool(stable_e)
+    if rec['converged'] and rec['internal_stable'] is False:
+        rec['note'].append('still internally UNSTABLE')
+    if rec['converged'] and rec['external_stable'] is False:
+        rec['note'].append('external instability (%s)' % ('RHF->UHF or real->complex' if method == 'rhf'
+                                                          else 'UHF->GHF or real->complex'))
+    if rec['converged']:
+        rec['energy'] = float(mf.e_tot)
+        if method == 'uhf' or is_rohf:
+            rec['s2'] = float(mf.spin_square()[0])
+        mf.dump_chk({'e_tot': mf.e_tot, 'mo_energy': mf.mo_energy,
+                     'mo_coeff': mf.mo_coeff, 'mo_occ': mf.mo_occ})
+    rec['scf_class'] = type(mf).__name__
+    log.note('RESULT %s NEWTON guess=%s  E=%s  converged=%s  internal_stable=%s  <S^2>=%s',
+             method.upper(), guess, rec['energy'], rec['converged'], rec['internal_stable'], rec['s2'])
+    return rec
+
+
+def find_targets(a, only, methods):
+    """{stem: (xyz paths, {method: {'old': present record or None, 'ref': reference entry or None}})}"""
+    ref = load_json(a.reference) or {}
+    uniq = {}       # identical files appear in several subfolders
+    for f in sorted(glob.glob(os.path.join(a.xyzdir, '*', '*.xyz'))):
+        uniq.setdefault(os.path.splitext(os.path.basename(f))[0], []).append(os.path.abspath(f))
+    out = {}
+    for stem, paths in uniq.items():
+        if only and stem not in only:
+            continue
+        todo = {}
+        for m in methods:
+            old = load_json(os.path.join(a.resdir, stem, '%s.%s.json' % (stem, m)))
+            if a.above_only and not only:
+                d = (old or {}).get('dE_ref_mEh')
+                if d is None or d <= a.tol_mEh:
+                    continue
+            todo[m] = {'old': old or {}, 'ref': ref.get(stem, {}).get(m) or {}}
+        if todo:
+            out[stem] = (paths, todo)
+    return out
+
+
+def summary(outdir):
+    f3 = lambda v: 'n/a' if v is None else '%.3f' % v
+    rows = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(outdir, '*', '*.json')))]
+    print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
+        'system', 'meth', 'guess', 'E', 'dE_ref/mEh', 'dE_old/mEh', '<S^2>', 'stable', 'all guesses: E - E_lowest (mEh)'))
+    for r in rows:
+        f = lambda v, p='%.4f': '' if v is None else p % v
+        cand = '  '.join('%s:%s' % (c['guess'], 'fail' if c['energy'] is None else '%.3f' % ((c['energy'] - r['energy']) * 1e3))
+                         for c in r['candidates']) if r.get('energy') is not None else 'nothing converged'
+        print('%-22s %-4s %-8s %16s %10s %10s %7s %6s  %s' % (
+            r['name'][:22], r['method'], r.get('init_guess'), f(r.get('energy'), '%.8f'), f(r.get('dE_ref_mEh')),
+            f(r.get('dE_prev_mEh')), f(r.get('s2'), '%.3f'), r.get('internal_stable'), cand))
+    d = [r['dE_ref_mEh'] for r in rows if r.get('dE_ref_mEh') is not None]
+    t = E_TOL * 1e3
+    print('%d records: %d not converged, vs the reference energy: %d same, %d below, %d above, %d without reference' % (
+        len(rows), sum(1 for r in rows if r.get('energy') is None), sum(1 for x in d if abs(x) <= t),
+        sum(1 for x in d if x < -t), sum(1 for x in d if x > t), len(rows) - len(d)))
+    for r in rows:
+        if r.get('dE_ref_mEh') is not None and abs(r['dE_ref_mEh']) > t:
+            print('   %-50s %-4s %+10.4f mEh  <S^2> %s (reference %s)' % (r['name'][:50], r['method'], r['dE_ref_mEh'],
+                  f3(r.get('s2')), f3(r.get('ref_s2'))))
+    lo = {(r['name'], r['method']): r.get('energy') for r in rows}
+    for (n_, m), e in sorted(lo.items()):
+        er = lo.get((n_, 'rhf'))
+        if m == 'uhf' and e is not None and er is not None and e > er + 1e-6:
+            print('   %-50s UHF is %.4f mEh ABOVE RHF/ROHF' % (n_[:50], (e - er) * 1e3))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('systems', nargs='*', help='stems or xyz files (default: all under --xyzdir)')
+    ap.add_argument('--above-only', action='store_true',
+                    help='only the records of --resdir that are more than --tol-mEh above the reference')
+    ap.add_argument('--reference', default=os.path.join(here, 'reference.json'))
+    ap.add_argument('--xyzdir', default=os.path.join(here, '..', 'xyzfiles'))
+    ap.add_argument('--resdir', default=os.path.join(here, 'results'), help='present dz results')
+    ap.add_argument('--outdir', default=os.path.join(here, 'results_newton'))
+    ap.add_argument('--methods', default='rhf,uhf')
+    ap.add_argument('--guesses', default='minao,atom,huckel,rhfchk,current')
+    ap.add_argument('--tol-mEh', type=float, default=E_TOL * 1e3,
+                    help='threshold of --above-only (default %(default)s)')
+    ap.add_argument('--conv-tol', type=float, default=1e-9)
+    ap.add_argument('--newton-max-cycle', type=int, default=200)
+    ap.add_argument('--max-stab', type=int, default=15)
+    ap.add_argument('--stab-tol', type=float, default=1e-4)
+    ap.add_argument('--external', choices=['on', 'off'], default='off',
+                    help='also run the external stability analysis (recorded only)')
+    ap.add_argument('--memory', type=int, default=4000, help='MB per calculation')
+    ap.add_argument('--force', action='store_true', help='rerun even if the json exists')
+    ap.add_argument('--replace', action='store_true',
+                    help='copy solutions lower than the present one over <resdir>/<stem>/ (json and chk)')
+    ap.add_argument('--list', action='store_true', help='only print "<xyz file> <methods>" of what would run')
+    ap.add_argument('--summary', action='store_true', help='only print the table of results_newton')
+    a = ap.parse_args()
+    if a.summary:
+        summary(a.outdir)
+        return
+
+    only = {os.path.splitext(os.path.basename(s))[0] for s in a.systems}
+    targets = find_targets(a, only, a.methods.split(','))
+    if a.list:
+        for s, (paths, todo) in targets.items():
+            print(paths[0], ','.join(sorted(todo)))
+        return
+    print('threads:', lib.num_threads(), ' targets:', sum(len(v[1]) for v in targets.values()),
+          'records in', len(targets), 'systems', flush=True)
+
+    for stem, (paths, todo) in targets.items():
+        sysdir = os.path.join(a.outdir, stem)
+        jf = lambda m, d=sysdir: os.path.join(d, '%s.%s.json' % (stem, m))
+        chk = lambda m, d=sysdir: os.path.join(d, '%s.%s.chk' % (stem, m))
+        olddir = os.path.join(a.resdir, stem)
+        gchk = lambda m, g, d=sysdir: os.path.join(d, '%s.%s.%s.chk' % (stem, m, g))
+        # done = json written by this version (it lists the chkfile of every guess)
+        done = lambda m: (load_json(jf(m)) or {}).get('all_chk_saved') is True
+        methods = [m for m in ('rhf', 'uhf') if m in todo and (a.force or not done(m))]
+        if not methods:
+            print('skip (done):', stem, flush=True)
+            continue
+        os.makedirs(sysdir, exist_ok=True)
+        logf = os.path.join(sysdir, '%s.newton.log' % stem)
+        mol = build_mol(paths[0], BASIS, logf, a.memory)
+        for method in methods:          # rhf first: its orbitals are the 'rhfchk' guess of uhf
+            t0, old, ref = time.time(), todo[method]['old'], todo[method]['ref']
+            own_rhf = load_json(jf('rhf'))
+            rhf_chk = chk('rhf') if (own_rhf and own_rhf.get('converged')) else chk('rhf', olddir)
+            cands, best = [], None
+            for guess in a.guesses.split(','):
+                if guess == 'rhfchk' and method == 'rhf':
+                    continue
+                tmp = gchk(method, guess)
+                try:
+                    dm0 = start_density(mol, new_mf(mol, method), method, guess, rhf_chk, chk(method, olddir))
+                    if dm0 is None:
+                        print('  %-22s %-4s %-8s not available, skipped' % (stem[:22], method, guess), flush=True)
+                        continue
+                    rec = run_guess(mol, method, guess, dm0, tmp, logf, a)
+                except Exception as ex:
+                    traceback.print_exc()
+                    rec = {'guess': guess, 'converged': False, 'energy': None, 'internal_stable': None,
+                           's2': None, 'note': ['ERROR: %r' % ex]}
+                rec['chkfile'] = tmp if os.path.exists(tmp) else None
+                cands.append(rec)
+                print('  %-22s %-4s %-8s E=%-18s conv=%-5s stab_i=%-5s <S^2>=%-7s %s' % (
+                    stem[:22], method, guess, rec['energy'], rec['converged'], rec['internal_stable'],
+                    None if rec.get('s2') is None else round(rec['s2'], 4), '; '.join(rec['note'])), flush=True)
+                # lowest converged solution; an internally stable one beats an unstable one
+                key = lambda r: (r['internal_stable'] is not True, r['energy'])
+                if rec['energy'] is not None and (best is None or key(rec) < key(best)
+                                                  and not (key(rec)[0] == key(best)[0]
+                                                           and rec['energy'] > best['energy'] - TIE)):
+                    best = rec
+            out = dict(best) if best else {'converged': False, 'energy': None, 'internal_stable': None,
+                                           'note': ['no guess converged']}
+            out['note'] = list(out.get('note', []))
+            out.update(method=method, name=stem, init_guess=out.pop('guess', None), solver='newton',
+                       all_chk_saved=True, lowest_chkfile=(best or {}).get('chkfile'),
+                       start='newton:%s' % (best['guess'] if best else None),
+                       candidates=[{k: c.get(k) for k in ('guess', 'energy', 's2', 'converged', 'internal_stable',
+                                                          'stab_rounds', 'note', 'chkfile')} for c in cands],
+                       ref_energy=ref.get('energy'), ref_s2=ref.get('s2'), prev_energy=old.get('energy'),
+                       prev_s2=old.get('s2'), xyz=paths, charge=mol.charge, mult=mol.spin + 1,
+                       subdirs=[os.path.basename(os.path.dirname(p)) for p in paths], basis=BASIS, x2c=True, nao=mol.nao, nelec=mol.nelec,
+                       chkfile=chk(method), logfile=logf, conv_tol=a.conv_tol,
+                       newton_max_cycle=a.newton_max_cycle, max_stab=a.max_stab, stab_tol=a.stab_tol,
+                       time_s=round(time.time() - t0, 1))
+            if best:
+                shutil.copy(best['chkfile'], chk(method))
+                for k, e0 in (('dE_ref_mEh', ref.get('energy')), ('dE_prev_mEh', old.get('energy'))):
+                    out[k] = None if e0 is None else (best['energy'] - e0) * 1e3
+                if out['dE_ref_mEh'] is not None and abs(out['dE_ref_mEh']) > E_TOL * 1e3:
+                    out['note'].append('%+.4f mEh relative to the reference energy' % out['dE_ref_mEh'])
+            with open(jf(method), 'w') as f:
+                json.dump(out, f, indent=1)
+            fm = lambda v: 'n/a' if v is None else '%+.4f' % v
+            print('%-22s %-4s LOWEST: %s  E=%s  vs reference %s mEh, vs present dz result %s mEh  (%.0fs)' % (
+                stem[:22], method, out['init_guess'], out['energy'], fm(out.get('dE_ref_mEh')),
+                fm(out.get('dE_prev_mEh')), out['time_s']), flush=True)
+            if a.replace and best and out.get('dE_prev_mEh') is not None and out['dE_prev_mEh'] < -E_TOL * 1e3 \
+                    and best['internal_stable']:
+                rep = dict(out, chkfile=chk(method, olddir))
+                shutil.copy(chk(method), chk(method, olddir))
+                with open(jf(method, olddir), 'w') as f:
+                    json.dump(rep, f, indent=1)
+                print('   -> replaced %s' % jf(method, olddir), flush=True)
+        mol.stdout.close()
+
+
+if __name__ == '__main__':
+    main()
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-20-33.cm.cluster', release='5.14.0-427.13.1.el9_4.x86_64', version='#1 SMP PREEMPT_DYNAMIC Wed Apr 10 10:29:16 EDT 2024', machine='x86_64')  Threads 2
+Python 3.11.15 | packaged by conda-forge | (main, Aug 11 2026, 10:26:29) [GCC 14.4.0]
+numpy 2.2.6  scipy 1.17.1  h5py 3.16.0
+Date: Sun Nov 15 21:42:23 2026
+PySCF version 2.14.0
+PySCF path  /resnick/groups/sharmagroup/yichi/pyscf
+GIT HEAD (branch master) 14fb93158ec9c97ae1d67462ea47b5b27ce63aca
+
+[ENV] PYSCF_EXT_PATH /resnick/groups/sharmagroup/yichi/pyscf-forge
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 4
+[INPUT] num. electrons = 42
+[INPUT] charge = 1
+[INPUT] spin (= nelec alpha-beta = 2S) = 4
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = Angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Mn     0.911157112559   0.000042789269   0.005036269474 AA    1.721837399186   0.000080859999   0.009517169995 Bohr   0.0
+[INPUT]  2 S     -1.447145109103   0.000283607234  -0.055823830014 AA   -2.734707918708   0.000535939999  -0.105491749951 Bohr   0.0
+[INPUT]  3 H     -1.885015168077   0.986376573245   0.752725181092 AA   -3.562162408317   1.863981579120   1.422444439328 Bohr   0.0
+[INPUT]  4 H     -1.874529468730  -0.997706119739   0.743685908274 AA   -3.542347308326  -1.885391319109   1.405362689336 Bohr   0.0
+
+nuclear repulsion = 111.216124174407
+number of shells = 18
+number of NR pGTOs = 177
+number of NR cGTOs = 71
+basis = cc-pvdz-dk
+ecp = {}
+CPU time:         0.60
+
+======================================================================
+  RHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.minao.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: minao
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eROHF'> ********
+method = SecondOrdersfX2C1eROHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.minao.chk
+max_memory 11264 MB (current use 112 MB)
+num. doubly occ = 19  num. singly occ = 4
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.minao.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 112 MB)
+Set conv_tol_grad to 3.16228e-05
+  HOMO = 0.0954575671746136  LUMO = 0.167680329605955  gap/eV = 1.96528
+Initial guess E= -1546.61308815852  |g|= 3.98324
+macro= 0  E= -1551.99625772634  delta_E= -5.38317  |g|= 3.06065  3 KF 15 JK
+macro= 1  E= -1554.70688411067  delta_E= -2.71063  |g|= 1.18963  3 KF 15 JK
+macro= 2  E= -1555.48037022012  delta_E= -0.773486  |g|= 0.656167  3 KF 15 JK
+macro= 3  E= -1556.14208224808  delta_E= -0.661712  |g|= 0.417505  3 KF 16 JK
+macro= 4  E= -1556.42203663638  delta_E= -0.279954  |g|= 0.212571  3 KF 18 JK
+macro= 5  E= -1556.48499796509  delta_E= -0.0629613  |g|= 0.15374  4 KF 20 JK
+macro= 6  E= -1556.59101454023  delta_E= -0.106017  |g|= 0.141344  3 KF 18 JK
+macro= 7  E= -1556.76150343365  delta_E= -0.170489  |g|= 0.212939  4 KF 20 JK
+macro= 8  E= -1556.78337354396  delta_E= -0.0218701  |g|= 0.0323443  4 KF 22 JK
+macro= 9  E= -1556.78384393706  delta_E= -0.000470393  |g|= 0.00795818  3 KF 13 JK
+macro= 10  E= -1556.78407347165  delta_E= -0.000229535  |g|= 0.00581287  2 KF 8 JK
+macro= 11  E= -1556.79102997354  delta_E= -0.0069565  |g|= 0.168857  3 KF 18 JK
+macro= 12  E= -1556.8228090827  delta_E= -0.0317791  |g|= 0.0450349  3 KF 13 JK
+macro= 13  E= -1556.83449529962  delta_E= -0.0116862  |g|= 0.117576  2 KF 7 JK
+macro= 14  E= -1556.83714249497  delta_E= -0.0026472  |g|= 0.00852917  3 KF 14 JK
+macro= 15  E= -1556.83822515688  delta_E= -0.00108266  |g|= 0.0217623  2 KF 8 JK
+macro= 16  E= -1556.83848311028  delta_E= -0.000257953  |g|= 0.00276823  3 KF 14 JK
+macro= 17  E= -1556.83850539757  delta_E= -2.22873e-05  |g|= 0.000875867  2 KF 8 JK
+macro= 18  E= -1556.83852092711  delta_E= -1.55295e-05  |g|= 0.0019137  2 KF 9 JK
+macro= 19  E= -1556.83852434704  delta_E= -3.41993e-06  |g|= 0.00036493  3 KF 16 JK
+macro= 20  E= -1556.83852567951  delta_E= -1.33247e-06  |g|= 0.000203997  3 KF 21 JK
+macro= 21  E= -1556.83852935643  delta_E= -3.67692e-06  |g|= 0.00032372  3 KF 20 JK
+macro= 22  E= -1556.83853807586  delta_E= -8.71943e-06  |g|= 0.000459526  3 KF 20 JK
+macro= 23  E= -1556.8385753754  delta_E= -3.72995e-05  |g|= 0.00151511  4 KF 23 JK
+macro= 24  E= -1556.83863417472  delta_E= -5.87993e-05  |g|= 0.00231283  4 KF 22 JK
+macro= 25  E= -1556.83868404891  delta_E= -4.98742e-05  |g|= 0.00191795  4 KF 22 JK
+macro= 26  E= -1556.83870436728  delta_E= -2.03184e-05  |g|= 0.00161857  3 KF 15 JK
+macro= 27  E= -1556.83873093619  delta_E= -2.65689e-05  |g|= 0.00101778  4 KF 23 JK
+macro= 28  E= -1556.83874772489  delta_E= -1.67887e-05  |g|= 0.000779199  4 KF 23 JK
+macro= 29  E= -1556.83875984246  delta_E= -1.21176e-05  |g|= 0.000574586  4 KF 24 JK
+macro= 30  E= -1556.83876581674  delta_E= -5.97428e-06  |g|= 0.000491352  3 KF 20 JK
+macro= 31  E= -1556.83877050171  delta_E= -4.68497e-06  |g|= 0.000385493  3 KF 21 JK
+macro= 32  E= -1556.83877463227  delta_E= -4.13057e-06  |g|= 0.000358675  3 KF 21 JK
+macro= 33  E= -1556.83877825981  delta_E= -3.62754e-06  |g|= 0.000278883  3 KF 21 JK
+macro= 34  E= -1556.83878169935  delta_E= -3.43954e-06  |g|= 0.00033903  3 KF 20 JK
+macro= 35  E= -1556.83878449304  delta_E= -2.79369e-06  |g|= 0.000276536  3 KF 21 JK
+macro= 36  E= -1556.83878709383  delta_E= -2.60079e-06  |g|= 0.000259444  3 KF 21 JK
+macro= 37  E= -1556.83878974192  delta_E= -2.64809e-06  |g|= 0.000293068  3 KF 21 JK
+macro= 38  E= -1556.83879203134  delta_E= -2.28943e-06  |g|= 0.000284347  3 KF 19 JK
+macro= 39  E= -1556.83879427444  delta_E= -2.2431e-06  |g|= 0.000276881  3 KF 21 JK
+macro= 40  E= -1556.83879624761  delta_E= -1.97317e-06  |g|= 0.000258992  3 KF 20 JK
+macro= 41  E= -1556.83879821085  delta_E= -1.96324e-06  |g|= 0.00024255  3 KF 21 JK
+macro= 42  E= -1556.83879996865  delta_E= -1.7578e-06  |g|= 0.000263152  3 KF 18 JK
+macro= 43  E= -1556.8388016198  delta_E= -1.65115e-06  |g|= 0.000241322  3 KF 21 JK
+macro= 44  E= -1556.8388032058  delta_E= -1.586e-06  |g|= 0.000241524  3 KF 18 JK
+macro= 45  E= -1556.83880472709  delta_E= -1.5213e-06  |g|= 0.000254317  3 KF 19 JK
+macro= 46  E= -1556.83880615292  delta_E= -1.42582e-06  |g|= 0.000191313  3 KF 21 JK
+macro= 47  E= -1556.83880755579  delta_E= -1.40287e-06  |g|= 0.000222758  3 KF 20 JK
+macro= 48  E= -1556.83880887208  delta_E= -1.31629e-06  |g|= 0.000190785  3 KF 18 JK
+macro= 49  E= -1556.83880944495  delta_E= -5.7287e-07  |g|= 0.000194316  2 KF 12 JK
+macro= 50  E= -1556.83881010093  delta_E= -6.55975e-07  |g|= 0.000192312  2 KF 11 JK
+macro= 51  E= -1556.83881071687  delta_E= -6.15943e-07  |g|= 0.000194098  2 KF 11 JK
+macro= 52  E= -1556.83881189109  delta_E= -1.17422e-06  |g|= 0.000177281  3 KF 17 JK
+macro= 53  E= -1556.83881294394  delta_E= -1.05285e-06  |g|= 0.000157837  3 KF 21 JK
+macro= 54  E= -1556.83881397593  delta_E= -1.03199e-06  |g|= 0.00015978  3 KF 19 JK
+macro= 55  E= -1556.83881493769  delta_E= -9.61758e-07  |g|= 0.000160003  3 KF 20 JK
+macro= 56  E= -1556.83881584573  delta_E= -9.08041e-07  |g|= 0.000160285  3 KF 19 JK
+macro= 57  E= -1556.83881625693  delta_E= -4.11203e-07  |g|= 0.000159398  2 KF 12 JK
+macro= 58  E= -1556.83881670105  delta_E= -4.44116e-07  |g|= 0.000155809  2 KF 11 JK
+macro= 59  E= -1556.83881711068  delta_E= -4.09628e-07  |g|= 0.000161323  2 KF 10 JK
+macro= 60  E= -1556.83881751776  delta_E= -4.07084e-07  |g|= 0.000166468  2 KF 10 JK
+macro= 61  E= -1556.83881791096  delta_E= -3.93196e-07  |g|= 0.000144376  2 KF 12 JK
+macro= 62  E= -1556.83881865884  delta_E= -7.4788e-07  |g|= 0.000136854  3 KF 16 JK
+macro= 63  E= -1556.83881899339  delta_E= -3.34551e-07  |g|= 0.00013498  2 KF 12 JK
+macro= 64  E= -1556.83881933905  delta_E= -3.45657e-07  |g|= 0.0001379  2 KF 12 JK
+macro= 65  E= -1556.83881965084  delta_E= -3.11794e-07  |g|= 0.000132831  2 KF 12 JK
+macro= 66  E= -1556.83881997384  delta_E= -3.23003e-07  |g|= 0.000146602  2 KF 12 JK
+macro= 67  E= -1556.83882027973  delta_E= -3.05885e-07  |g|= 0.000124702  2 KF 12 JK
+macro= 68  E= -1556.83882056255  delta_E= -2.82827e-07  |g|= 0.000121573  2 KF 12 JK
+macro= 69  E= -1556.83882085044  delta_E= -2.87881e-07  |g|= 0.000124674  2 KF 12 JK
+macro= 70  E= -1556.83882112519  delta_E= -2.74751e-07  |g|= 0.000114767  2 KF 12 JK
+macro= 71  E= -1556.8388213839  delta_E= -2.58715e-07  |g|= 0.000116439  2 KF 11 JK
+macro= 72  E= -1556.83882163642  delta_E= -2.52514e-07  |g|= 0.000122763  2 KF 12 JK
+macro= 73  E= -1556.8388218777  delta_E= -2.4128e-07  |g|= 0.000111652  2 KF 12 JK
+macro= 74  E= -1556.83882211575  delta_E= -2.38059e-07  |g|= 0.000111154  1 KF 11 JK
+macro= 75  E= -1556.83882234248  delta_E= -2.26722e-07  |g|= 0.000105603  1 KF 11 JK
+macro= 76  E= -1556.83882255514  delta_E= -2.12662e-07  |g|= 0.000102033  2 KF 12 JK
+macro= 77  E= -1556.83882275445  delta_E= -1.99311e-07  |g|= 0.000105291  2 KF 12 JK
+macro= 78  E= -1556.83882295202  delta_E= -1.97567e-07  |g|= 0.00010235  2 KF 12 JK
+macro= 79  E= -1556.83882313984  delta_E= -1.8782e-07  |g|= 0.000103753  2 KF 12 JK
+macro= 80  E= -1556.83882331743  delta_E= -1.77589e-07  |g|= 9.85232e-05  2 KF 12 JK
+macro= 81  E= -1556.83882349322  delta_E= -1.7579e-07  |g|= 9.93403e-05  2 KF 12 JK
+macro= 82  E= -1556.83882365743  delta_E= -1.64215e-07  |g|= 9.40826e-05  2 KF 12 JK
+macro= 83  E= -1556.8388238169  delta_E= -1.59469e-07  |g|= 9.34772e-05  2 KF 12 JK
+macro= 84  E= -1556.83882397085  delta_E= -1.53952e-07  |g|= 9.14006e-05  2 KF 12 JK
+macro= 85  E= -1556.83882412207  delta_E= -1.51221e-07  |g|= 8.76985e-05  1 KF 11 JK
+macro= 86  E= -1556.83882439972  delta_E= -2.77648e-07  |g|= 8.7098e-05  2 KF 15 JK
+macro= 87  E= -1556.83882452586  delta_E= -1.26135e-07  |g|= 7.8715e-05  2 KF 12 JK
+macro= 88  E= -1556.83882477316  delta_E= -2.47301e-07  |g|= 7.77911e-05  2 KF 14 JK
+macro= 89  E= -1556.8388249968  delta_E= -2.23645e-07  |g|= 7.53932e-05  2 KF 15 JK
+macro= 90  E= -1556.83882520042  delta_E= -2.03617e-07  |g|= 7.30076e-05  2 KF 16 JK
+macro= 91  E= -1556.83882538219  delta_E= -1.81769e-07  |g|= 6.72436e-05  2 KF 19 JK
+macro= 92  E= -1556.83882554801  delta_E= -1.65818e-07  |g|= 6.31792e-05  2 KF 18 JK
+macro= 93  E= -1556.83882562701  delta_E= -7.90005e-08  |g|= 6.37353e-05  1 KF 12 JK
+macro= 94  E= -1556.83882577254  delta_E= -1.45537e-07  |g|= 6.00741e-05  2 KF 20 JK
+macro= 95  E= -1556.83882590439  delta_E= -1.3185e-07  |g|= 5.58298e-05  2 KF 18 JK
+macro= 96  E= -1556.83882602576  delta_E= -1.2137e-07  |g|= 5.27994e-05  2 KF 18 JK
+macro= 97  E= -1556.83882608088  delta_E= -5.51192e-08  |g|= 5.39041e-05  1 KF 12 JK
+macro= 98  E= -1556.83882618542  delta_E= -1.04539e-07  |g|= 5.68893e-05  2 KF 17 JK
+macro= 99  E= -1556.83882628036  delta_E= -9.49349e-08  |g|= 4.97949e-05  2 KF 18 JK
+macro= 100  E= -1556.83882636715  delta_E= -8.67894e-08  |g|= 4.50762e-05  2 KF 17 JK
+macro= 101  E= -1556.83882644702  delta_E= -7.98759e-08  |g|= 4.74508e-05  2 KF 16 JK
+macro= 102  E= -1556.83882652074  delta_E= -7.37191e-08  |g|= 4.1317e-05  2 KF 16 JK
+macro= 103  E= -1556.8388265848  delta_E= -6.40568e-08  |g|= 4.17039e-05  2 KF 17 JK
+macro= 104  E= -1556.83882664295  delta_E= -5.81501e-08  |g|= 3.74555e-05  2 KF 18 JK
+macro= 105  E= -1556.83882669607  delta_E= -5.31245e-08  |g|= 3.63954e-05  2 KF 18 JK
+macro= 106  E= -1556.83882671947  delta_E= -2.33917e-08  |g|= 3.73557e-05  1 KF 12 JK
+macro= 107  E= -1556.83882676551  delta_E= -4.60473e-08  |g|= 4.12292e-05  2 KF 17 JK
+macro= 108  E= -1556.83882678778  delta_E= -2.22713e-08  |g|= 3.51206e-05  1 KF 11 JK
+macro= 109  E= -1556.83882680828  delta_E= -2.04932e-08  |g|= 3.22793e-05  1 KF 10 JK
+macro= 110  E= -1556.83882682823  delta_E= -1.99507e-08  |g|= 3.25951e-05  1 KF 8 JK
+macro= 111  E= -1556.83882684781  delta_E= -1.95832e-08  |g|= 3.13303e-05  1 KF 9 JK
+macro= 112  E= -1556.83882686639  delta_E= -1.85755e-08  |g|= 3.22282e-05  1 KF 10 JK
+macro= 113  E= -1556.83882688407  delta_E= -1.76819e-08  |g|= 3.10136e-05  1 KF 10 JK
+macro= 114  E= -1556.83882690095  delta_E= -1.68848e-08  |g|= 2.94075e-05  1 KF 8 JK
+macro= 115  E= -1556.83882691661  delta_E= -1.56597e-08  |g|= 2.94974e-05  1 KF 7 JK
+macro= 116  E= -1556.83882693228  delta_E= -1.56624e-08  |g|= 2.85157e-05  1 KF 8 JK
+macro= 117  E= -1556.83882694685  delta_E= -1.45701e-08  |g|= 2.82137e-05  1 KF 10 JK
+macro= 118  E= -1556.83882696085  delta_E= -1.4003e-08  |g|= 2.72878e-05  1 KF 10 JK
+macro= 119  E= -1556.838826974  delta_E= -1.31533e-08  |g|= 2.5745e-05  1 KF 9 JK
+macro= 120  E= -1556.83882698642  delta_E= -1.24157e-08  |g|= 2.57308e-05  1 KF 7 JK
+macro= 121  E= -1556.83882699809  delta_E= -1.16756e-08  |g|= 2.38058e-05  1 KF 7 JK
+macro= 122  E= -1556.8388270094  delta_E= -1.13034e-08  |g|= 2.65687e-05  1 KF 7 JK
+macro= 123  E= -1556.83882701975  delta_E= -1.035e-08  |g|= 2.60534e-05  1 KF 7 JK
+macro= 124  E= -1556.8388270303  delta_E= -1.05526e-08  |g|= 2.16222e-05  1 KF 7 JK
+macro= 125  E= -1556.83882703983  delta_E= -9.53105e-09  |g|= 2.40787e-05  1 KF 8 JK
+macro= 126  E= -1556.8388270493  delta_E= -9.4733e-09  |g|= 2.11447e-05  1 KF 7 JK
+macro= 127  E= -1556.83882705762  delta_E= -8.31847e-09  |g|= 2.07075e-05  1 KF 6 JK
+macro= 128  E= -1556.83882706602  delta_E= -8.39532e-09  |g|= 2.09976e-05  1 KF 6 JK
+macro= 129  E= -1556.83882707393  delta_E= -7.91397e-09  |g|= 2.18917e-05  1 KF 8 JK
+macro= 130  E= -1556.83882708166  delta_E= -7.72911e-09  |g|= 2.00757e-05  1 KF 7 JK
+macro= 131  E= -1556.83882708879  delta_E= -7.12885e-09  |g|= 1.95297e-05  1 KF 8 JK
+macro= 132  E= -1556.83882709582  delta_E= -7.03267e-09  |g|= 1.98845e-05  1 KF 7 JK
+macro= 133  E= -1556.83882710206  delta_E= -6.24073e-09  |g|= 1.71348e-05  1 KF 6 JK
+macro= 134  E= -1556.83882710822  delta_E= -6.16069e-09  |g|= 1.88445e-05  1 KF 6 JK
+macro= 135  E= -1556.83882711296  delta_E= -4.74029e-09  |g|= 1.92031e-05  1 KF 6 JK
+macro= 136  E= -1556.83882711904  delta_E= -6.07406e-09  |g|= 1.58218e-05  1 KF 6 JK
+macro= 137  E= -1556.83882712435  delta_E= -5.31418e-09  |g|= 1.91679e-05  1 KF 6 JK
+macro= 138  E= -1556.83882712954  delta_E= -5.19276e-09  |g|= 1.51023e-05  1 KF 7 JK
+macro= 139  E= -1556.83882713435  delta_E= -4.80532e-09  |g|= 1.42566e-05  1 KF 6 JK
+macro= 140  E= -1556.83882713895  delta_E= -4.60318e-09  |g|= 1.74482e-05  1 KF 5 JK
+macro= 141  E= -1556.83882714292  delta_E= -3.96244e-09  |g|= 1.66487e-05  1 KF 6 JK
+macro= 142  E= -1556.83882714731  delta_E= -4.39604e-09  |g|= 1.49347e-05  1 KF 5 JK
+macro= 143  E= -1556.8388271513  delta_E= -3.99132e-09  |g|= 1.61936e-05  1 KF 6 JK
+macro= 144  E= -1556.83882715498  delta_E= -3.68095e-09  |g|= 1.44681e-05  1 KF 5 JK
+macro= 145  E= -1556.83882715869  delta_E= -3.71097e-09  |g|= 1.39914e-05  1 KF 6 JK
+macro= 146  E= -1556.8388271621  delta_E= -3.40697e-09  |g|= 1.35384e-05  1 KF 5 JK
+macro= 147  E= -1556.838827165  delta_E= -2.90311e-09  |g|= 1.50215e-05  1 KF 5 JK
+macro= 148  E= -1556.83882716814  delta_E= -3.1323e-09  |g|= 1.35333e-05  1 KF 5 JK
+macro= 149  E= -1556.83882717105  delta_E= -2.90856e-09  |g|= 1.38747e-05  1 KF 5 JK
+macro= 150  E= -1556.83882717376  delta_E= -2.71621e-09  |g|= 1.36354e-05  1 KF 5 JK
+macro= 151  E= -1556.83882717632  delta_E= -2.55864e-09  |g|= 1.31281e-05  1 KF 5 JK
+macro= 152  E= -1556.83882717897  delta_E= -2.64731e-09  |g|= 1.1512e-05  1 KF 5 JK
+macro= 153  E= -1556.8388271813  delta_E= -2.3324e-09  |g|= 1.26638e-05  1 KF 5 JK
+macro= 154  E= -1556.83882718347  delta_E= -2.16801e-09  |g|= 9.22461e-06  1 KF 5 JK
+macro= 155  E= -1556.83882718575  delta_E= -2.27669e-09  |g|= 9.54581e-06  1 KF 5 JK
+macro= 156  E= -1556.83882718789  delta_E= -2.14914e-09  |g|= 9.32753e-06  1 KF 5 JK
+macro= 157  E= -1556.83882718951  delta_E= -1.61435e-09  |g|= 9.89162e-06  1 KF 4 JK
+macro= 158  E= -1556.83882719121  delta_E= -1.70326e-09  |g|= 1.30257e-05  1 KF 5 JK
+macro= 159  E= -1556.83882719292  delta_E= -1.70371e-09  |g|= 1.23435e-05  1 KF 4 JK
+macro= 160  E= -1556.83882719354  delta_E= -6.28461e-10  |g|= 1.30918e-05  1 KF 3 JK
+Canonicalize SCF orbitals
+macro X = 161  E=-1556.83882719354  |g|= 1.30918e-05  total 323 KF 2221 JK
+converged SCF energy = -1556.83882719354
+--- stability analysis, round 0 ---
+rohf_internal: lowest eigs of H = [0.01007156 0.01838302 0.03598796]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> wavefunction is stable in the internal stability analysis
+RESULT RHF NEWTON guess=minao  E=-1556.838827193544  converged=True  internal_stable=True  <S^2>=6.0
+Initial guess from the superposition of atomic densities.
+Spherically averaged atomic HF for {'S', 'H', 'Mn'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmplx9_td8e
+max_memory 11264 MB (current use 144 MB)
+atom = Mn
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1144.83801469159
+cycle= 1 E= -1139.48462344969  delta_E= 5.35  |g|=    0  |ddm|= 8.35
+cycle= 2 E= -1141.05695300507  delta_E= -1.57  |g|=    0  |ddm|= 16.3
+cycle= 3 E= -1145.21135054758  delta_E= -4.15  |g|=    0  |ddm|= 14.3
+cycle= 4 E= -1145.39592278271  delta_E= -0.185  |g|=    0  |ddm|= 0.763
+cycle= 5 E= -1145.40896680254  delta_E= -0.013  |g|=    0  |ddm|= 0.166
+cycle= 6 E= -1145.40905454519  delta_E= -8.77e-05  |g|=    0  |ddm|= 0.0234
+cycle= 7 E= -1145.40906145832  delta_E= -6.91e-06  |g|=    0  |ddm|= 0.00536
+cycle= 8 E= -1145.40906292386  delta_E= -1.47e-06  |g|=    0  |ddm|= 0.00415
+cycle= 9 E= -1145.40906292505  delta_E= -1.18e-09  |g|=    0  |ddm|= 0.000105
+cycle= 10 E= -1145.40906292506  delta_E= -8.64e-12  |g|=    0  |ddm|= 1.38e-05
+Extra cycle  E= -1145.40906292506  delta_E= -2.05e-12  |g|=    0  |ddm|= 9.49e-08
+Atomic HF for atom  Mn  converged. SCF energy = -1145.40906292506
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpf8jnwl_z
+max_memory 11264 MB (current use 153 MB)
+atom = S
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -396.92188350895
+cycle= 1 E= -396.929751369149  delta_E= -0.00787  |g|=    0  |ddm|= 0.15
+cycle= 2 E= -396.929927981947  delta_E= -0.000177  |g|=    0  |ddm|= 0.0424
+cycle= 3 E= -396.929937411953  delta_E= -9.43e-06  |g|=    0  |ddm|= 0.00615
+cycle= 4 E= -396.929937609035  delta_E= -1.97e-07  |g|=    0  |ddm|= 0.0018
+cycle= 5 E= -396.929937609066  delta_E= -3.03e-11  |g|=    0  |ddm|= 1.06e-05
+Extra cycle  E= -396.929937609066  delta_E= -2.27e-13  |g|=    0  |ddm|= 2.44e-07
+Atomic HF for atom  S  converged. SCF energy = -396.929937609066
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+
+======================================================================
+  RHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.atom.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: atom
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eROHF'> ********
+method = SecondOrdersfX2C1eROHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.atom.chk
+max_memory 11264 MB (current use 153 MB)
+num. doubly occ = 19  num. singly occ = 4
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.atom.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 153 MB)
+Set conv_tol_grad to 3.16228e-05
+  HOMO = -0.0854579867314014  LUMO = 0.0242538653327484  gap/eV = 2.98541
+Initial guess E= -1556.53167127113  |g|= 0.87707
+macro= 0  E= -1556.82832596385  delta_E= -0.296655  |g|= 0.185972  3 KF 11 JK
+macro= 1  E= -1556.83846576467  delta_E= -0.0101398  |g|= 0.00281939  4 KF 16 JK
+macro= 2  E= -1556.83852463235  delta_E= -5.88677e-05  |g|= 0.000127199  3 KF 18 JK
+macro= 3  E= -1556.83852532672  delta_E= -6.94374e-07  |g|= 0.000248898  2 KF 8 JK
+macro= 4  E= -1556.83852654186  delta_E= -1.21513e-06  |g|= 0.000264064  2 KF 11 JK
+macro= 5  E= -1556.83852870235  delta_E= -2.16049e-06  |g|= 0.000338026  2 KF 10 JK
+macro= 6  E= -1556.83853908528  delta_E= -1.03829e-05  |g|= 0.000618444  3 KF 14 JK
+macro= 7  E= -1556.83856198923  delta_E= -2.2904e-05  |g|= 0.00137516  3 KF 15 JK
+macro= 8  E= -1556.83858399903  delta_E= -2.20098e-05  |g|= 0.0012929  2 KF 14 JK
+macro= 9  E= -1556.83862897074  delta_E= -4.49717e-05  |g|= 0.00139687  3 KF 17 JK
+macro= 10  E= -1556.83866288489  delta_E= -3.39141e-05  |g|= 0.00263717  3 KF 14 JK
+macro= 11  E= -1556.83869424259  delta_E= -3.13577e-05  |g|= 0.00154682  3 KF 19 JK
+macro= 12  E= -1556.8387151653  delta_E= -2.09227e-05  |g|= 0.000985081  3 KF 19 JK
+macro= 13  E= -1556.83873155635  delta_E= -1.6391e-05  |g|= 0.00101535  3 KF 19 JK
+macro= 14  E= -1556.83874293962  delta_E= -1.13833e-05  |g|= 0.000747938  3 KF 18 JK
+macro= 15  E= -1556.83875257669  delta_E= -9.63707e-06  |g|= 0.000582556  3 KF 20 JK
+macro= 16  E= -1556.83875967028  delta_E= -7.09359e-06  |g|= 0.000444228  3 KF 19 JK
+macro= 17  E= -1556.83876604462  delta_E= -6.37434e-06  |g|= 0.000501104  3 KF 19 JK
+macro= 18  E= -1556.83877109411  delta_E= -5.04948e-06  |g|= 0.000416064  3 KF 17 JK
+macro= 19  E= -1556.83877531676  delta_E= -4.22265e-06  |g|= 0.000375755  3 KF 20 JK
+macro= 20  E= -1556.8387789146  delta_E= -3.59784e-06  |g|= 0.000321368  3 KF 19 JK
+macro= 21  E= -1556.8387824104  delta_E= -3.4958e-06  |g|= 0.000362277  3 KF 19 JK
+macro= 22  E= -1556.8387855243  delta_E= -3.1139e-06  |g|= 0.000298601  3 KF 17 JK
+macro= 23  E= -1556.83878822762  delta_E= -2.70332e-06  |g|= 0.000329244  3 KF 17 JK
+macro= 24  E= -1556.83879069067  delta_E= -2.46304e-06  |g|= 0.00027431  3 KF 21 JK
+macro= 25  E= -1556.83879310045  delta_E= -2.40978e-06  |g|= 0.000266317  3 KF 21 JK
+macro= 26  E= -1556.83879509363  delta_E= -1.99318e-06  |g|= 0.000353011  3 KF 16 JK
+macro= 27  E= -1556.83879708853  delta_E= -1.9949e-06  |g|= 0.0002221  3 KF 21 JK
+macro= 28  E= -1556.83879879762  delta_E= -1.70909e-06  |g|= 0.000326145  3 KF 17 JK
+macro= 29  E= -1556.83880059052  delta_E= -1.7929e-06  |g|= 0.000217878  3 KF 19 JK
+macro= 30  E= -1556.83880234433  delta_E= -1.75382e-06  |g|= 0.000217047  3 KF 19 JK
+macro= 31  E= -1556.83880396493  delta_E= -1.62059e-06  |g|= 0.000221809  3 KF 17 JK
+macro= 32  E= -1556.8388046811  delta_E= -7.16172e-07  |g|= 0.000214757  2 KF 11 JK
+macro= 33  E= -1556.83880545263  delta_E= -7.71532e-07  |g|= 0.000252961  2 KF 10 JK
+macro= 34  E= -1556.83880622213  delta_E= -7.69497e-07  |g|= 0.000227357  2 KF 11 JK
+macro= 35  E= -1556.83880767855  delta_E= -1.45642e-06  |g|= 0.000219232  3 KF 15 JK
+macro= 36  E= -1556.83880833174  delta_E= -6.53191e-07  |g|= 0.000194081  2 KF 11 JK
+macro= 37  E= -1556.83880902272  delta_E= -6.90984e-07  |g|= 0.000231659  2 KF 11 JK
+macro= 38  E= -1556.83880966856  delta_E= -6.45839e-07  |g|= 0.000203409  2 KF 11 JK
+macro= 39  E= -1556.83881026352  delta_E= -5.9496e-07  |g|= 0.000185298  2 KF 11 JK
+macro= 40  E= -1556.83881089055  delta_E= -6.27022e-07  |g|= 0.000218649  2 KF 11 JK
+macro= 41  E= -1556.83881207082  delta_E= -1.18027e-06  |g|= 0.000194156  3 KF 19 JK
+macro= 42  E= -1556.83881317053  delta_E= -1.09971e-06  |g|= 0.000200458  3 KF 16 JK
+macro= 43  E= -1556.83881367771  delta_E= -5.0718e-07  |g|= 0.000166113  2 KF 12 JK
+macro= 44  E= -1556.83881464222  delta_E= -9.64503e-07  |g|= 0.00022266  3 KF 19 JK
+macro= 45  E= -1556.83881553953  delta_E= -8.97313e-07  |g|= 0.000176685  3 KF 20 JK
+macro= 46  E= -1556.83881642819  delta_E= -8.88664e-07  |g|= 0.000180716  3 KF 17 JK
+macro= 47  E= -1556.83881685843  delta_E= -4.30235e-07  |g|= 0.00015453  2 KF 12 JK
+macro= 48  E= -1556.83881726492  delta_E= -4.06488e-07  |g|= 0.000143907  2 KF 11 JK
+macro= 49  E= -1556.8388176653  delta_E= -4.00382e-07  |g|= 0.000170666  2 KF 11 JK
+macro= 50  E= -1556.83881803919  delta_E= -3.73887e-07  |g|= 0.000143735  2 KF 12 JK
+macro= 51  E= -1556.83881873716  delta_E= -6.97969e-07  |g|= 0.000192914  3 KF 17 JK
+macro= 52  E= -1556.8388194129  delta_E= -6.75746e-07  |g|= 0.000142099  3 KF 17 JK
+macro= 53  E= -1556.8388200424  delta_E= -6.29498e-07  |g|= 0.00014595  3 KF 17 JK
+macro= 54  E= -1556.8388206362  delta_E= -5.93801e-07  |g|= 0.000127754  3 KF 17 JK
+macro= 55  E= -1556.83882117858  delta_E= -5.42376e-07  |g|= 0.000128148  3 KF 16 JK
+macro= 56  E= -1556.83882166716  delta_E= -4.88579e-07  |g|= 0.000129569  3 KF 17 JK
+macro= 57  E= -1556.83882212195  delta_E= -4.54796e-07  |g|= 0.00013377  3 KF 19 JK
+macro= 58  E= -1556.83882254904  delta_E= -4.27093e-07  |g|= 0.000164771  3 KF 17 JK
+macro= 59  E= -1556.83882275503  delta_E= -2.05986e-07  |g|= 0.000108062  2 KF 12 JK
+macro= 60  E= -1556.83882313689  delta_E= -3.81858e-07  |g|= 0.000135443  3 KF 17 JK
+macro= 61  E= -1556.83882349251  delta_E= -3.55623e-07  |g|= 9.70199e-05  3 KF 17 JK
+macro= 62  E= -1556.83882381038  delta_E= -3.17868e-07  |g|= 0.00010939  3 KF 16 JK
+macro= 63  E= -1556.83882411023  delta_E= -2.99854e-07  |g|= 0.000113671  2 KF 16 JK
+macro= 64  E= -1556.8388242541  delta_E= -1.43872e-07  |g|= 8.38904e-05  1 KF 11 JK
+macro= 65  E= -1556.83882438919  delta_E= -1.35086e-07  |g|= 8.13746e-05  1 KF 10 JK
+macro= 66  E= -1556.83882464493  delta_E= -2.55742e-07  |g|= 7.80498e-05  2 KF 16 JK
+macro= 67  E= -1556.83882498664  delta_E= -3.41711e-07  |g|= 7.47803e-05  3 KF 18 JK
+macro= 68  E= -1556.83882509228  delta_E= -1.05637e-07  |g|= 7.06712e-05  1 KF 11 JK
+macro= 69  E= -1556.83882519216  delta_E= -9.98766e-08  |g|= 6.92724e-05  1 KF 10 JK
+macro= 70  E= -1556.83882528858  delta_E= -9.64283e-08  |g|= 6.71343e-05  1 KF 10 JK
+macro= 71  E= -1556.8388253796  delta_E= -9.10184e-08  |g|= 6.57768e-05  1 KF 10 JK
+macro= 72  E= -1556.83882554696  delta_E= -1.67359e-07  |g|= 6.72677e-05  2 KF 17 JK
+macro= 73  E= -1556.83882562585  delta_E= -7.88864e-08  |g|= 6.26578e-05  1 KF 11 JK
+macro= 74  E= -1556.83882577494  delta_E= -1.49092e-07  |g|= 6.62926e-05  2 KF 16 JK
+macro= 75  E= -1556.83882584451  delta_E= -6.95713e-08  |g|= 5.76258e-05  1 KF 10 JK
+macro= 76  E= -1556.83882591111  delta_E= -6.66037e-08  |g|= 5.611e-05  1 KF 10 JK
+macro= 77  E= -1556.83882597447  delta_E= -6.33602e-08  |g|= 5.44182e-05  1 KF 11 JK
+macro= 78  E= -1556.83882603395  delta_E= -5.94766e-08  |g|= 5.42201e-05  1 KF 10 JK
+macro= 79  E= -1556.83882609196  delta_E= -5.80067e-08  |g|= 5.17838e-05  1 KF 11 JK
+macro= 80  E= -1556.83882611217  delta_E= -2.0211e-08  |g|= 5.15963e-05  1 KF 8 JK
+macro= 81  E= -1556.83882617378  delta_E= -6.16094e-08  |g|= 0.000124388  1 KF 7 JK
+macro= 82  E= -1556.8388262247  delta_E= -5.09235e-08  |g|= 6.23727e-05  1 KF 12 JK
+macro= 83  E= -1556.83882623804  delta_E= -1.33421e-08  |g|= 4.37699e-05  1 KF 6 JK
+macro= 84  E= -1556.83882629282  delta_E= -5.47795e-08  |g|= 5.81731e-05  1 KF 11 JK
+macro= 85  E= -1556.83882638113  delta_E= -8.83092e-08  |g|= 4.85066e-05  2 KF 17 JK
+macro= 86  E= -1556.83882642234  delta_E= -4.12069e-08  |g|= 4.63306e-05  1 KF 11 JK
+macro= 87  E= -1556.83882649713  delta_E= -7.47914e-08  |g|= 5.2152e-05  2 KF 15 JK
+macro= 88  E= -1556.83882656608  delta_E= -6.8947e-08  |g|= 4.76418e-05  2 KF 15 JK
+macro= 89  E= -1556.83882662838  delta_E= -6.22977e-08  |g|= 4.27697e-05  2 KF 16 JK
+macro= 90  E= -1556.83882668468  delta_E= -5.63048e-08  |g|= 3.88674e-05  2 KF 15 JK
+macro= 91  E= -1556.83882673454  delta_E= -4.98635e-08  |g|= 4.95301e-05  2 KF 17 JK
+macro= 92  E= -1556.83882678077  delta_E= -4.62212e-08  |g|= 4.01969e-05  2 KF 17 JK
+macro= 93  E= -1556.83882682285  delta_E= -4.20891e-08  |g|= 3.47874e-05  2 KF 16 JK
+macro= 94  E= -1556.83882684085  delta_E= -1.79946e-08  |g|= 3.25341e-05  1 KF 10 JK
+macro= 95  E= -1556.83882686012  delta_E= -1.92683e-08  |g|= 2.97592e-05  1 KF 9 JK
+macro= 96  E= -1556.83882687823  delta_E= -1.81153e-08  |g|= 3.08829e-05  1 KF 9 JK
+macro= 97  E= -1556.83882689487  delta_E= -1.66326e-08  |g|= 2.97726e-05  1 KF 9 JK
+macro= 98  E= -1556.83882691132  delta_E= -1.64539e-08  |g|= 2.94112e-05  1 KF 8 JK
+macro= 99  E= -1556.83882692711  delta_E= -1.57888e-08  |g|= 2.92811e-05  1 KF 9 JK
+macro= 100  E= -1556.8388269329  delta_E= -5.79621e-09  |g|= 2.70597e-05  1 KF 7 JK
+macro= 101  E= -1556.83882694956  delta_E= -1.66588e-08  |g|= 4.74561e-05  1 KF 6 JK
+macro= 102  E= -1556.83882696356  delta_E= -1.39985e-08  |g|= 3.40019e-05  1 KF 12 JK
+macro= 103  E= -1556.8388269661  delta_E= -2.53931e-09  |g|= 2.37167e-05  1 KF 5 JK
+macro= 104  E= -1556.83882698075  delta_E= -1.46465e-08  |g|= 4.08216e-05  1 KF 8 JK
+macro= 105  E= -1556.83882699279  delta_E= -1.20442e-08  |g|= 3.3052e-05  1 KF 11 JK
+macro= 106  E= -1556.83882700464  delta_E= -1.185e-08  |g|= 2.26493e-05  1 KF 10 JK
+macro= 107  E= -1556.83882701567  delta_E= -1.10299e-08  |g|= 2.43969e-05  1 KF 9 JK
+macro= 108  E= -1556.83882702223  delta_E= -6.56291e-09  |g|= 2.42292e-05  1 KF 7 JK
+macro= 109  E= -1556.8388270335  delta_E= -1.12652e-08  |g|= 3.17445e-05  1 KF 8 JK
+macro= 110  E= -1556.83882703682  delta_E= -3.31806e-09  |g|= 2.57939e-05  1 KF 7 JK
+macro= 111  E= -1556.83882704733  delta_E= -1.05124e-08  |g|= 3.61255e-05  1 KF 8 JK
+macro= 112  E= -1556.83882705647  delta_E= -9.13951e-09  |g|= 2.79479e-05  1 KF 11 JK
+macro= 113  E= -1556.83882706159  delta_E= -5.12341e-09  |g|= 1.86947e-05  1 KF 7 JK
+macro= 114  E= -1556.83882707091  delta_E= -9.31936e-09  |g|= 3.33593e-05  1 KF 8 JK
+macro= 115  E= -1556.83882707283  delta_E= -1.91358e-09  |g|= 2.30067e-05  1 KF 7 JK
+macro= 116  E= -1556.83882708014  delta_E= -7.31779e-09  |g|= 1.73011e-05  1 KF 6 JK
+macro= 117  E= -1556.83882708815  delta_E= -8.00583e-09  |g|= 3.27429e-05  1 KF 10 JK
+macro= 118  E= -1556.8388270907  delta_E= -2.54659e-09  |g|= 1.8666e-05  1 KF 5 JK
+macro= 119  E= -1556.83882709853  delta_E= -7.83439e-09  |g|= 3.53955e-05  1 KF 7 JK
+macro= 120  E= -1556.83882709956  delta_E= -1.02546e-09  |g|= 2.34771e-05  1 KF 3 JK
+macro= 121  E= -1556.83882709955  delta_E= 9.09495e-13  |g|= 1.11817e-05  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 122  E=-1556.83882709955  |g|= 1.11817e-05  total 246 KF 1723 JK
+converged SCF energy = -1556.83882709955
+--- stability analysis, round 0 ---
+rohf_internal: lowest eigs of H = [0.01002916 0.01837192 0.03596171]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> wavefunction is stable in the internal stability analysis
+RESULT RHF NEWTON guess=atom  E=-1556.838827099555  converged=True  internal_stable=True  <S^2>=6.0
+Initial guess from on-the-fly Huckel, doi:10.1021/acs.jctc.8b01089.
+Initial guess from on-the-fly Huckel, doi:10.1021/acs.jctc.8b01089.
+Spherically averaged atomic HF for {'S', 'H', 'Mn'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmptb0_1cc7
+max_memory 11264 MB (current use 182 MB)
+atom = Mn
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1144.83801469159
+cycle= 1 E= -1139.48462344969  delta_E= 5.35  |g|=    0  |ddm|= 8.35
+cycle= 2 E= -1141.05695300507  delta_E= -1.57  |g|=    0  |ddm|= 16.3
+cycle= 3 E= -1145.21135054758  delta_E= -4.15  |g|=    0  |ddm|= 14.3
+cycle= 4 E= -1145.39592278271  delta_E= -0.185  |g|=    0  |ddm|= 0.763
+cycle= 5 E= -1145.40896680254  delta_E= -0.013  |g|=    0  |ddm|= 0.166
+cycle= 6 E= -1145.40905454519  delta_E= -8.77e-05  |g|=    0  |ddm|= 0.0234
+cycle= 7 E= -1145.40906145832  delta_E= -6.91e-06  |g|=    0  |ddm|= 0.00536
+cycle= 8 E= -1145.40906292386  delta_E= -1.47e-06  |g|=    0  |ddm|= 0.00415
+cycle= 9 E= -1145.40906292505  delta_E= -1.18e-09  |g|=    0  |ddm|= 0.000105
+cycle= 10 E= -1145.40906292506  delta_E= -1.27e-11  |g|=    0  |ddm|= 1.38e-05
+Extra cycle  E= -1145.40906292506  delta_E= 2.05e-12  |g|=    0  |ddm|= 9.49e-08
+Atomic HF for atom  Mn  converged. SCF energy = -1145.40906292506
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmp0tntf433
+max_memory 11264 MB (current use 182 MB)
+atom = S
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -396.92188350895
+cycle= 1 E= -396.929751369149  delta_E= -0.00787  |g|=    0  |ddm|= 0.15
+cycle= 2 E= -396.929927981947  delta_E= -0.000177  |g|=    0  |ddm|= 0.0424
+cycle= 3 E= -396.929937411953  delta_E= -9.43e-06  |g|=    0  |ddm|= 0.00615
+cycle= 4 E= -396.929937609035  delta_E= -1.97e-07  |g|=    0  |ddm|= 0.0018
+cycle= 5 E= -396.929937609066  delta_E= -3.04e-11  |g|=    0  |ddm|= 1.06e-05
+Extra cycle  E= -396.929937609066  delta_E= -3.41e-13  |g|=    0  |ddm|= 2.44e-07
+Atomic HF for atom  S  converged. SCF energy = -396.929937609066
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+  alpha nocc = 23  HOMO = -0.0660220452106338  LUMO = 0.249752528406423
+
+WARN: beta  nocc = 19  HOMO -0.104191153978726 >= LUMO -0.103691679651684
+
+
+WARN: HOMO -0.0660220452106338 >= LUMO -0.103691679651684
+
+
+======================================================================
+  RHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.huckel.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: huckel
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eROHF'> ********
+method = SecondOrdersfX2C1eROHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.huckel.chk
+max_memory 11264 MB (current use 182 MB)
+num. doubly occ = 19  num. singly occ = 4
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.huckel.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 182 MB)
+Set conv_tol_grad to 3.16228e-05
+  HOMO = -0.616301786970203  LUMO = -0.240064545340952  gap/eV = 10.23794
+Initial guess E= -1556.60413714549  |g|= 0.981819
+macro= 0  E= -1556.80124913254  delta_E= -0.197112  |g|= 0.165634  4 KF 20 JK
+macro= 1  E= -1556.83342995411  delta_E= -0.0321808  |g|= 0.0544658  3 KF 10 JK
+macro= 2  E= -1556.8354359528  delta_E= -0.002006  |g|= 0.0113822  3 KF 15 JK
+macro= 3  E= -1556.8377578739  delta_E= -0.00232192  |g|= 0.0337895  3 KF 15 JK
+macro= 4  E= -1556.8384868427  delta_E= -0.000728969  |g|= 0.00753675  3 KF 9 JK
+macro= 5  E= -1556.83852272968  delta_E= -3.5887e-05  |g|= 0.00125288  3 KF 12 JK
+macro= 6  E= -1556.8385240657  delta_E= -1.33602e-06  |g|= 0.000572609  2 KF 11 JK
+macro= 7  E= -1556.83852514916  delta_E= -1.08346e-06  |g|= 0.000174701  3 KF 19 JK
+macro= 8  E= -1556.83852618554  delta_E= -1.03638e-06  |g|= 0.000283465  2 KF 11 JK
+macro= 9  E= -1556.83852808203  delta_E= -1.89649e-06  |g|= 0.000324081  2 KF 11 JK
+macro= 10  E= -1556.83853107356  delta_E= -2.99153e-06  |g|= 0.000430218  2 KF 10 JK
+macro= 11  E= -1556.83853655371  delta_E= -5.48015e-06  |g|= 0.000623891  2 KF 10 JK
+macro= 12  E= -1556.83854497539  delta_E= -8.42168e-06  |g|= 0.000726473  2 KF 10 JK
+macro= 13  E= -1556.83855817409  delta_E= -1.31987e-05  |g|= 0.0011197  2 KF 10 JK
+macro= 14  E= -1556.83857489239  delta_E= -1.67183e-05  |g|= 0.00117474  2 KF 10 JK
+macro= 15  E= -1556.83859526864  delta_E= -2.03762e-05  |g|= 0.0016354  2 KF 9 JK
+macro= 16  E= -1556.83864196709  delta_E= -4.66985e-05  |g|= 0.00167124  3 KF 13 JK
+macro= 17  E= -1556.83867588615  delta_E= -3.39191e-05  |g|= 0.0020242  3 KF 18 JK
+macro= 18  E= -1556.83870182131  delta_E= -2.59352e-05  |g|= 0.00147027  3 KF 16 JK
+macro= 19  E= -1556.83872038912  delta_E= -1.85678e-05  |g|= 0.0010003  3 KF 17 JK
+macro= 20  E= -1556.83873412871  delta_E= -1.37396e-05  |g|= 0.000912267  3 KF 18 JK
+macro= 21  E= -1556.83874477989  delta_E= -1.06512e-05  |g|= 0.000626489  3 KF 19 JK
+macro= 22  E= -1556.83875334792  delta_E= -8.56803e-06  |g|= 0.000530994  3 KF 19 JK
+macro= 23  E= -1556.8387602762  delta_E= -6.92828e-06  |g|= 0.000405686  3 KF 19 JK
+macro= 24  E= -1556.83876622654  delta_E= -5.95034e-06  |g|= 0.000387128  3 KF 20 JK
+macro= 25  E= -1556.83877140766  delta_E= -5.18112e-06  |g|= 0.000383211  3 KF 19 JK
+macro= 26  E= -1556.83877576451  delta_E= -4.35685e-06  |g|= 0.000352596  3 KF 20 JK
+macro= 27  E= -1556.83877947638  delta_E= -3.71187e-06  |g|= 0.000345704  3 KF 19 JK
+macro= 28  E= -1556.83878272059  delta_E= -3.24422e-06  |g|= 0.000282895  3 KF 19 JK
+macro= 29  E= -1556.8387856156  delta_E= -2.89501e-06  |g|= 0.000267709  3 KF 19 JK
+macro= 30  E= -1556.8387883501  delta_E= -2.7345e-06  |g|= 0.000266743  3 KF 19 JK
+macro= 31  E= -1556.83879191783  delta_E= -3.56772e-06  |g|= 0.000315109  4 KF 25 JK
+macro= 32  E= -1556.83879306704  delta_E= -1.14922e-06  |g|= 0.000266209  2 KF 11 JK
+macro= 33  E= -1556.83879422782  delta_E= -1.16078e-06  |g|= 0.000314795  2 KF 11 JK
+macro= 34  E= -1556.83879532236  delta_E= -1.09454e-06  |g|= 0.000259268  2 KF 11 JK
+macro= 35  E= -1556.83879638745  delta_E= -1.06509e-06  |g|= 0.000252164  2 KF 11 JK
+macro= 36  E= -1556.83879740645  delta_E= -1.019e-06  |g|= 0.000279265  2 KF 11 JK
+macro= 37  E= -1556.83879840423  delta_E= -9.97782e-07  |g|= 0.000245961  2 KF 11 JK
+macro= 38  E= -1556.83879935819  delta_E= -9.53956e-07  |g|= 0.000263864  2 KF 11 JK
+macro= 39  E= -1556.83880028551  delta_E= -9.27321e-07  |g|= 0.000253455  2 KF 11 JK
+macro= 40  E= -1556.83880118146  delta_E= -8.95949e-07  |g|= 0.000245337  2 KF 11 JK
+macro= 41  E= -1556.83880207137  delta_E= -8.89912e-07  |g|= 0.000290572  2 KF 11 JK
+macro= 42  E= -1556.83880376018  delta_E= -1.68881e-06  |g|= 0.000254826  2 KF 14 JK
+macro= 43  E= -1556.83880452817  delta_E= -7.67994e-07  |g|= 0.000207052  2 KF 11 JK
+macro= 44  E= -1556.83880531422  delta_E= -7.86044e-07  |g|= 0.000229873  2 KF 11 JK
+macro= 45  E= -1556.83880606873  delta_E= -7.54507e-07  |g|= 0.000213734  2 KF 11 JK
+macro= 46  E= -1556.83880680365  delta_E= -7.34922e-07  |g|= 0.000200233  2 KF 11 JK
+macro= 47  E= -1556.83880750818  delta_E= -7.04533e-07  |g|= 0.000204678  2 KF 11 JK
+macro= 48  E= -1556.83880820817  delta_E= -6.99994e-07  |g|= 0.000203653  2 KF 11 JK
+macro= 49  E= -1556.83880888121  delta_E= -6.73038e-07  |g|= 0.000198288  2 KF 11 JK
+macro= 50  E= -1556.83880953036  delta_E= -6.4915e-07  |g|= 0.000197773  2 KF 11 JK
+macro= 51  E= -1556.83881017117  delta_E= -6.40809e-07  |g|= 0.000202441  2 KF 11 JK
+macro= 52  E= -1556.83881079834  delta_E= -6.27167e-07  |g|= 0.000191796  2 KF 11 JK
+macro= 53  E= -1556.8388113941  delta_E= -5.95757e-07  |g|= 0.000180363  2 KF 11 JK
+macro= 54  E= -1556.8388119769  delta_E= -5.82805e-07  |g|= 0.000180714  2 KF 11 JK
+macro= 55  E= -1556.83881253806  delta_E= -5.61154e-07  |g|= 0.000198046  2 KF 11 JK
+macro= 56  E= -1556.83881308805  delta_E= -5.49993e-07  |g|= 0.000191503  2 KF 11 JK
+macro= 57  E= -1556.8388136239  delta_E= -5.35856e-07  |g|= 0.000189122  2 KF 12 JK
+macro= 58  E= -1556.83881414627  delta_E= -5.22368e-07  |g|= 0.000175336  2 KF 12 JK
+macro= 59  E= -1556.83881465166  delta_E= -5.05387e-07  |g|= 0.000165392  2 KF 12 JK
+macro= 60  E= -1556.83881513351  delta_E= -4.81855e-07  |g|= 0.000158836  2 KF 12 JK
+macro= 61  E= -1556.8388155869  delta_E= -4.53383e-07  |g|= 0.000152204  2 KF 12 JK
+macro= 62  E= -1556.83881643991  delta_E= -8.53017e-07  |g|= 0.000170008  3 KF 18 JK
+macro= 63  E= -1556.83881726988  delta_E= -8.29963e-07  |g|= 0.000143702  3 KF 18 JK
+macro= 64  E= -1556.83881803734  delta_E= -7.67457e-07  |g|= 0.000143117  3 KF 17 JK
+macro= 65  E= -1556.83881876  delta_E= -7.22661e-07  |g|= 0.000145863  2 KF 16 JK
+macro= 66  E= -1556.83881943147  delta_E= -6.71471e-07  |g|= 0.000131438  3 KF 17 JK
+macro= 67  E= -1556.83882005749  delta_E= -6.2602e-07  |g|= 0.000151207  3 KF 16 JK
+macro= 68  E= -1556.83882063972  delta_E= -5.82228e-07  |g|= 0.000134723  3 KF 17 JK
+macro= 69  E= -1556.83882117682  delta_E= -5.37105e-07  |g|= 0.000144052  2 KF 16 JK
+macro= 70  E= -1556.83882168508  delta_E= -5.08263e-07  |g|= 0.000115497  2 KF 18 JK
+macro= 71  E= -1556.83882191245  delta_E= -2.27372e-07  |g|= 0.000110461  2 KF 12 JK
+macro= 72  E= -1556.83882234341  delta_E= -4.30957e-07  |g|= 0.000199756  3 KF 16 JK
+macro= 73  E= -1556.83882254803  delta_E= -2.04619e-07  |g|= 0.000134135  2 KF 11 JK
+macro= 74  E= -1556.83882275465  delta_E= -2.06622e-07  |g|= 0.000129229  2 KF 10 JK
+macro= 75  E= -1556.8388229558  delta_E= -2.01149e-07  |g|= 0.000109008  2 KF 11 JK
+macro= 76  E= -1556.83882314439  delta_E= -1.88591e-07  |g|= 0.000100342  1 KF 10 JK
+macro= 77  E= -1556.83882332887  delta_E= -1.84473e-07  |g|= 9.15585e-05  2 KF 12 JK
+macro= 78  E= -1556.83882350556  delta_E= -1.76693e-07  |g|= 9.39781e-05  2 KF 12 JK
+macro= 79  E= -1556.8388236725  delta_E= -1.66942e-07  |g|= 9.0198e-05  2 KF 11 JK
+macro= 80  E= -1556.83882383409  delta_E= -1.61589e-07  |g|= 9.94443e-05  1 KF 10 JK
+macro= 81  E= -1556.83882398459  delta_E= -1.50505e-07  |g|= 8.63417e-05  2 KF 12 JK
+macro= 82  E= -1556.83882426374  delta_E= -2.79151e-07  |g|= 0.000117068  2 KF 16 JK
+macro= 83  E= -1556.83882451805  delta_E= -2.54307e-07  |g|= 8.94484e-05  3 KF 16 JK
+macro= 84  E= -1556.83882475733  delta_E= -2.39282e-07  |g|= 8.52738e-05  2 KF 16 JK
+macro= 85  E= -1556.83882497512  delta_E= -2.17789e-07  |g|= 0.000105654  2 KF 16 JK
+macro= 86  E= -1556.83882518046  delta_E= -2.05332e-07  |g|= 6.8585e-05  2 KF 17 JK
+macro= 87  E= -1556.83882536269  delta_E= -1.82238e-07  |g|= 7.48773e-05  2 KF 17 JK
+macro= 88  E= -1556.83882553505  delta_E= -1.72356e-07  |g|= 6.28185e-05  2 KF 18 JK
+macro= 89  E= -1556.83882569225  delta_E= -1.57202e-07  |g|= 6.51446e-05  2 KF 16 JK
+macro= 90  E= -1556.83882576544  delta_E= -7.31843e-08  |g|= 5.90136e-05  1 KF 10 JK
+macro= 91  E= -1556.83882583486  delta_E= -6.94286e-08  |g|= 5.82546e-05  1 KF 10 JK
+macro= 92  E= -1556.83882596391  delta_E= -1.29049e-07  |g|= 5.51153e-05  2 KF 17 JK
+macro= 93  E= -1556.83882608118  delta_E= -1.17263e-07  |g|= 5.89473e-05  2 KF 16 JK
+macro= 94  E= -1556.83882613548  delta_E= -5.43062e-08  |g|= 5.35684e-05  1 KF 10 JK
+macro= 95  E= -1556.83882618663  delta_E= -5.11527e-08  |g|= 5.02095e-05  1 KF 10 JK
+macro= 96  E= -1556.83882628273  delta_E= -9.60981e-08  |g|= 5.02758e-05  2 KF 17 JK
+macro= 97  E= -1556.83882637032  delta_E= -8.75873e-08  |g|= 4.88318e-05  2 KF 17 JK
+macro= 98  E= -1556.83882641134  delta_E= -4.10175e-08  |g|= 4.59344e-05  1 KF 11 JK
+macro= 99  E= -1556.83882648753  delta_E= -7.61938e-08  |g|= 4.60102e-05  2 KF 16 JK
+macro= 100  E= -1556.83882655706  delta_E= -6.9524e-08  |g|= 4.24643e-05  2 KF 16 JK
+macro= 101  E= -1556.83882661966  delta_E= -6.25996e-08  |g|= 4.62468e-05  2 KF 15 JK
+macro= 102  E= -1556.8388266772  delta_E= -5.75483e-08  |g|= 4.5187e-05  2 KF 15 JK
+macro= 103  E= -1556.83882672896  delta_E= -5.17557e-08  |g|= 4.44195e-05  2 KF 16 JK
+macro= 104  E= -1556.83882675349  delta_E= -2.45291e-08  |g|= 3.45891e-05  1 KF 10 JK
+macro= 105  E= -1556.83882677676  delta_E= -2.32703e-08  |g|= 3.36877e-05  1 KF 9 JK
+macro= 106  E= -1556.83882679903  delta_E= -2.22694e-08  |g|= 3.29223e-05  1 KF 8 JK
+macro= 107  E= -1556.83882681985  delta_E= -2.08195e-08  |g|= 3.1742e-05  1 KF 8 JK
+macro= 108  E= -1556.83882684007  delta_E= -2.02187e-08  |g|= 3.28309e-05  1 KF 9 JK
+macro= 109  E= -1556.83882685923  delta_E= -1.91617e-08  |g|= 3.17231e-05  1 KF 10 JK
+macro= 110  E= -1556.83882687735  delta_E= -1.81271e-08  |g|= 2.94445e-05  1 KF 9 JK
+macro= 111  E= -1556.83882689466  delta_E= -1.73009e-08  |g|= 2.99781e-05  1 KF 9 JK
+macro= 112  E= -1556.83882691101  delta_E= -1.63548e-08  |g|= 2.88416e-05  1 KF 9 JK
+macro= 113  E= -1556.83882692682  delta_E= -1.58068e-08  |g|= 2.83816e-05  1 KF 10 JK
+macro= 114  E= -1556.83882694156  delta_E= -1.47397e-08  |g|= 2.62511e-05  1 KF 9 JK
+macro= 115  E= -1556.83882695553  delta_E= -1.39689e-08  |g|= 2.68498e-05  1 KF 9 JK
+macro= 116  E= -1556.83882696913  delta_E= -1.36015e-08  |g|= 2.75384e-05  1 KF 9 JK
+macro= 117  E= -1556.83882698199  delta_E= -1.28666e-08  |g|= 2.46959e-05  1 KF 8 JK
+macro= 118  E= -1556.83882699422  delta_E= -1.22232e-08  |g|= 2.54209e-05  1 KF 8 JK
+macro= 119  E= -1556.83882700571  delta_E= -1.14958e-08  |g|= 2.39246e-05  1 KF 7 JK
+macro= 120  E= -1556.83882701672  delta_E= -1.10078e-08  |g|= 2.47956e-05  1 KF 6 JK
+macro= 121  E= -1556.83882702725  delta_E= -1.05292e-08  |g|= 2.35181e-05  1 KF 7 JK
+macro= 122  E= -1556.83882703724  delta_E= -9.98944e-09  |g|= 2.15136e-05  1 KF 7 JK
+macro= 123  E= -1556.83882704668  delta_E= -9.43965e-09  |g|= 2.09559e-05  1 KF 6 JK
+macro= 124  E= -1556.83882705566  delta_E= -8.9849e-09  |g|= 2.13563e-05  1 KF 8 JK
+macro= 125  E= -1556.83882706396  delta_E= -8.29186e-09  |g|= 2.05685e-05  1 KF 8 JK
+macro= 126  E= -1556.83882707201  delta_E= -8.05653e-09  |g|= 2.14514e-05  1 KF 8 JK
+macro= 127  E= -1556.83882707988  delta_E= -7.87099e-09  |g|= 2.03287e-05  1 KF 8 JK
+macro= 128  E= -1556.83882708729  delta_E= -7.40647e-09  |g|= 1.90993e-05  1 KF 9 JK
+macro= 129  E= -1556.8388270943  delta_E= -7.00538e-09  |g|= 1.9745e-05  1 KF 9 JK
+macro= 130  E= -1556.83882710091  delta_E= -6.61339e-09  |g|= 1.83807e-05  1 KF 8 JK
+macro= 131  E= -1556.83882710712  delta_E= -6.20889e-09  |g|= 1.7337e-05  1 KF 7 JK
+macro= 132  E= -1556.83882711314  delta_E= -6.02017e-09  |g|= 1.74713e-05  1 KF 8 JK
+macro= 133  E= -1556.83882711889  delta_E= -5.74983e-09  |g|= 1.74325e-05  1 KF 9 JK
+macro= 134  E= -1556.83882711963  delta_E= -7.42148e-10  |g|= 1.64141e-05  1 KF 3 JK
+Canonicalize SCF orbitals
+macro X = 135  E=-1556.83882711963  |g|= 1.64141e-05  total 266 KF 1825 JK
+converged SCF energy = -1556.83882711963
+--- stability analysis, round 0 ---
+rohf_internal: lowest eigs of H = [0.01003422 0.01837316 0.03596087]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> wavefunction is stable in the internal stability analysis
+RESULT RHF NEWTON guess=huckel  E=-1556.8388271196297  converged=True  internal_stable=True  <S^2>=6.0
+
+======================================================================
+  RHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.current.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: current
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eROHF'> ********
+method = SecondOrdersfX2C1eROHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.current.chk
+max_memory 11264 MB (current use 182 MB)
+num. doubly occ = 19  num. singly occ = 4
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.rhf.current.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 182 MB)
+Set conv_tol_grad to 3.16228e-05
+  HOMO = -0.238436089694558  LUMO = -0.155314600768478  gap/eV = 2.26185
+Initial guess E= -1556.83882720245  |g|= 7.74931e-06
+macro= 0  E= -1556.83882720246  delta_E= -1.00044e-11  |g|= 7.74931e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 1  E=-1556.83882720246  |g|= 7.74931e-06  total 2 KF 4 JK
+converged SCF energy = -1556.83882720246
+--- stability analysis, round 0 ---
+rohf_internal: lowest eigs of H = [0.01012157 0.01841232 0.03610923]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> wavefunction is stable in the internal stability analysis
+RESULT RHF NEWTON guess=current  E=-1556.8388272024563  converged=True  internal_stable=True  <S^2>=6.0
+
+======================================================================
+  UHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.minao.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: minao
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.minao.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.minao.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = 0.0954575671746585  LUMO = 0.167680329605875
+  beta  nocc = 19  HOMO = 0.0431075270944872  LUMO = 0.0753841091549742
+
+WARN: HOMO 0.0954575671746585 >= LUMO 0.0753841091549742
+
+Initial guess E= -1546.61308815852  |g|= 2.87373
+macro= 0  E= -1549.26855883262  delta_E= -2.65547  |g|= 2.11125  3 KF 15 JK
+macro= 1  E= -1555.2206503909  delta_E= -5.95209  |g|= 1.21457  3 KF 15 JK
+macro= 2  E= -1556.23929954988  delta_E= -1.01865  |g|= 0.671961  3 KF 15 JK
+macro= 3  E= -1556.72729663049  delta_E= -0.487997  |g|= 0.239318  3 KF 17 JK
+macro= 4  E= -1556.82631747772  delta_E= -0.0990208  |g|= 0.0629532  3 KF 13 JK
+macro= 5  E= -1556.83357799265  delta_E= -0.00726051  |g|= 0.0213385  4 KF 19 JK
+macro= 6  E= -1556.83581868025  delta_E= -0.00224069  |g|= 0.000627422  5 KF 31 JK
+macro= 7  E= -1556.83582978077  delta_E= -1.11005e-05  |g|= 0.000297576  4 KF 32 JK
+macro= 8  E= -1556.83583044332  delta_E= -6.62553e-07  |g|= 3.09654e-05  4 KF 35 JK
+macro= 9  E= -1556.8358304434  delta_E= -7.9126e-11  |g|= 1.30034e-05  1 KF 3 JK
+Canonicalize SCF orbitals
+macro X = 10  E=-1556.8358304434  |g|= 1.30034e-05  total 34 KF 206 JK
+converged SCF energy = -1556.8358304434  <S^2> = 6.7675259  2S+1 = 5.2981227
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.00122716 0.01599905 0.04542003]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=minao  E=-1556.835830443399  converged=True  internal_stable=True  <S^2>=6.767525907558362
+Spherically averaged atomic HF for {'S', 'H', 'Mn'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpovu0ftei
+max_memory 11264 MB (current use 183 MB)
+atom = Mn
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1144.83801469159
+cycle= 1 E= -1139.48462344969  delta_E= 5.35  |g|=    0  |ddm|= 8.35
+cycle= 2 E= -1141.05695300507  delta_E= -1.57  |g|=    0  |ddm|= 16.3
+cycle= 3 E= -1145.21135054758  delta_E= -4.15  |g|=    0  |ddm|= 14.3
+cycle= 4 E= -1145.39592278271  delta_E= -0.185  |g|=    0  |ddm|= 0.763
+cycle= 5 E= -1145.40896680254  delta_E= -0.013  |g|=    0  |ddm|= 0.166
+cycle= 6 E= -1145.40905454519  delta_E= -8.77e-05  |g|=    0  |ddm|= 0.0234
+cycle= 7 E= -1145.40906145832  delta_E= -6.91e-06  |g|=    0  |ddm|= 0.00536
+cycle= 8 E= -1145.40906292386  delta_E= -1.47e-06  |g|=    0  |ddm|= 0.00415
+cycle= 9 E= -1145.40906292505  delta_E= -1.18e-09  |g|=    0  |ddm|= 0.000105
+cycle= 10 E= -1145.40906292506  delta_E= -1.36e-11  |g|=    0  |ddm|= 1.38e-05
+Extra cycle  E= -1145.40906292506  delta_E= 1.14e-12  |g|=    0  |ddm|= 9.49e-08
+Atomic HF for atom  Mn  converged. SCF energy = -1145.40906292506
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmp4snurzjc
+max_memory 11264 MB (current use 183 MB)
+atom = S
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -396.92188350895
+cycle= 1 E= -396.929751369149  delta_E= -0.00787  |g|=    0  |ddm|= 0.15
+cycle= 2 E= -396.929927981947  delta_E= -0.000177  |g|=    0  |ddm|= 0.0424
+cycle= 3 E= -396.929937411953  delta_E= -9.43e-06  |g|=    0  |ddm|= 0.00615
+cycle= 4 E= -396.929937609036  delta_E= -1.97e-07  |g|=    0  |ddm|= 0.0018
+cycle= 5 E= -396.929937609066  delta_E= -3.03e-11  |g|=    0  |ddm|= 1.06e-05
+Extra cycle  E= -396.929937609066  delta_E= -1.71e-13  |g|=    0  |ddm|= 2.44e-07
+Atomic HF for atom  S  converged. SCF energy = -396.929937609066
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+
+======================================================================
+  UHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: atom
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.085457986731337  LUMO = 0.0242538653327626
+  beta  nocc = 19  HOMO = -0.117420099865935  LUMO = -0.109524548281902
+
+WARN: HOMO -0.085457986731337 >= LUMO -0.109524548281902
+
+Initial guess E= -1556.53167127113  |g|= 0.742812
+macro= 0  E= -1556.82688807182  delta_E= -0.295217  |g|= 0.159177  3 KF 12 JK
+macro= 1  E= -1556.84431205509  delta_E= -0.017424  |g|= 0.00542961  4 KF 17 JK
+macro= 2  E= -1556.84440779667  delta_E= -9.57416e-05  |g|= 0.0001805  3 KF 14 JK
+macro= 3  E= -1556.84440774524  delta_E= 5.14292e-08  |g|= 0.000126289  1 KF 11 JK
+macro= 4  E= -1556.84440774524  delta_E= 1.13687e-12  |g|= 1.22297e-05  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 5  E=-1556.84440774524  |g|= 1.22297e-05  total 13 KF 62 JK
+converged SCF energy = -1556.84440774524  <S^2> = 6.0285885  2S+1 = 5.0114224
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [-0.02782663  0.01147369  0.01317262]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction has an internal instability
+internal instability -> step along +v and Newton SCF
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.629445076477069  LUMO = -0.0456231290747878
+  beta  nocc = 19  HOMO = -0.473585781028159  LUMO = -0.13875942274356
+  HOMO = -0.473585781028  LUMO = -0.138759422744  gap/eV = 9.11109
+Initial guess E= -1556.84612641006  |g|= 0.244346
+macro= 0  E= -1556.90271787081  delta_E= -0.0565915  |g|= 0.107718  3 KF 19 JK
+macro= 1  E= -1556.91580728029  delta_E= -0.0130894  |g|= 0.0375583  3 KF 12 JK
+macro= 2  E= -1556.91594242962  delta_E= -0.000135149  |g|= 4.00451e-05  3 KF 12 JK
+macro= 3  E= -1556.91594242962  delta_E= 2.27374e-12  |g|= 7.67377e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 4  E=-1556.91594242962  |g|= 7.67377e-06  total 11 KF 50 JK
+converged SCF energy = -1556.91594242962  <S^2> = 6.9615479  2S+1 = 5.3708651
+step +v: E = -1556.9159424296  converged = True
+internal instability -> step along -v and Newton SCF
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.atom.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.629374744820267  LUMO = -0.0461718004253323
+  beta  nocc = 19  HOMO = -0.47438731096828  LUMO = -0.139039052232626
+  HOMO = -0.474387310968  LUMO = -0.139039052233  gap/eV = 9.12529
+Initial guess E= -1556.8455592378  |g|= 0.246114
+macro= 0  E= -1556.90264624362  delta_E= -0.057087  |g|= 0.107587  3 KF 19 JK
+macro= 1  E= -1556.91581154308  delta_E= -0.0131653  |g|= 0.0377306  3 KF 12 JK
+macro= 2  E= -1556.91594242963  delta_E= -0.000130887  |g|= 3.95933e-05  3 KF 12 JK
+macro= 3  E= -1556.91594242963  delta_E= -9.09495e-13  |g|= 7.38975e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 4  E=-1556.91594242963  |g|= 7.38975e-06  total 11 KF 50 JK
+converged SCF energy = -1556.91594242963  <S^2> = 6.9615481  2S+1 = 5.3708651
+step -v: E = -1556.9159424296  converged = True
+--- stability analysis, round 1 ---
+uhf_internal: lowest eigs of H = [0.16348862 0.17893631 0.19913692]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=atom  E=-1556.915942429626  converged=True  internal_stable=True  <S^2>=6.961548100676691
+Initial guess from on-the-fly Huckel, doi:10.1021/acs.jctc.8b01089.
+Spherically averaged atomic HF for {'S', 'H', 'Mn'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpflgpiizk
+max_memory 11264 MB (current use 183 MB)
+atom = Mn
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1144.83801469159
+cycle= 1 E= -1139.48462344969  delta_E= 5.35  |g|=    0  |ddm|= 8.35
+cycle= 2 E= -1141.05695300507  delta_E= -1.57  |g|=    0  |ddm|= 16.3
+cycle= 3 E= -1145.21135054758  delta_E= -4.15  |g|=    0  |ddm|= 14.3
+cycle= 4 E= -1145.39592278271  delta_E= -0.185  |g|=    0  |ddm|= 0.763
+cycle= 5 E= -1145.40896680254  delta_E= -0.013  |g|=    0  |ddm|= 0.166
+cycle= 6 E= -1145.40905454519  delta_E= -8.77e-05  |g|=    0  |ddm|= 0.0234
+cycle= 7 E= -1145.40906145832  delta_E= -6.91e-06  |g|=    0  |ddm|= 0.00536
+cycle= 8 E= -1145.40906292386  delta_E= -1.47e-06  |g|=    0  |ddm|= 0.00415
+cycle= 9 E= -1145.40906292505  delta_E= -1.18e-09  |g|=    0  |ddm|= 0.000105
+cycle= 10 E= -1145.40906292506  delta_E= -1.27e-11  |g|=    0  |ddm|= 1.38e-05
+Extra cycle  E= -1145.40906292506  delta_E= 1.36e-12  |g|=    0  |ddm|= 9.49e-08
+Atomic HF for atom  Mn  converged. SCF energy = -1145.40906292506
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /tmp/tmpy97vgai0
+max_memory 11264 MB (current use 183 MB)
+atom = S
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -396.92188350895
+cycle= 1 E= -396.929751369149  delta_E= -0.00787  |g|=    0  |ddm|= 0.15
+cycle= 2 E= -396.929927981947  delta_E= -0.000177  |g|=    0  |ddm|= 0.0424
+cycle= 3 E= -396.929937411953  delta_E= -9.43e-06  |g|=    0  |ddm|= 0.00615
+cycle= 4 E= -396.929937609035  delta_E= -1.97e-07  |g|=    0  |ddm|= 0.0018
+cycle= 5 E= -396.929937609066  delta_E= -3.01e-11  |g|=    0  |ddm|= 1.06e-05
+Extra cycle  E= -396.929937609066  delta_E= -2.27e-13  |g|=    0  |ddm|= 2.44e-07
+Atomic HF for atom  S  converged. SCF energy = -396.929937609066
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.499278400906055
+
+  alpha nocc = 23  HOMO = -0.0660220452106452  LUMO = 0.249752528406413
+
+WARN: beta  nocc = 19  HOMO -0.104191153978733 >= LUMO -0.103691679651676
+
+
+WARN: HOMO -0.0660220452106452 >= LUMO -0.103691679651676
+
+
+======================================================================
+  UHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.huckel.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: huckel
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.huckel.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.huckel.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.728392393750107  LUMO = -0.17095065572087
+  beta  nocc = 19  HOMO = -0.728557461523234  LUMO = -0.237974088825467
+  HOMO = -0.72839239375  LUMO = -0.237974088825  gap/eV = 13.34496
+Initial guess E= -1556.71810570778  |g|= 0.612234
+macro= 0  E= -1556.82468158652  delta_E= -0.106576  |g|= 0.0666077  3 KF 11 JK
+macro= 1  E= -1556.83707081814  delta_E= -0.0123892  |g|= 0.0555546  2 KF 6 JK
+macro= 2  E= -1556.84047518321  delta_E= -0.00340437  |g|= 0.00692856  3 KF 12 JK
+macro= 3  E= -1556.86966042527  delta_E= -0.0291852  |g|= 0.100265  3 KF 21 JK
+macro= 4  E= -1556.91014685489  delta_E= -0.0404864  |g|= 0.108921  3 KF 19 JK
+macro= 5  E= -1556.9159290657  delta_E= -0.00578221  |g|= 0.0127811  3 KF 9 JK
+macro= 6  E= -1556.91594242965  delta_E= -1.33639e-05  |g|= 3.78015e-05  3 KF 12 JK
+macro= 7  E= -1556.91594242965  delta_E= -1.36424e-12  |g|= 6.07661e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 8  E=-1556.91594242965  |g|= 6.07661e-06  total 22 KF 101 JK
+converged SCF energy = -1556.91594242965  <S^2> = 6.9615504  2S+1 = 5.370866
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.1634898  0.17893606 0.19912838]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=huckel  E=-1556.915942429647  converged=True  internal_stable=True  <S^2>=6.96155038174787
+
+======================================================================
+  UHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.rhfchk.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: rhfchk
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.rhfchk.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.rhfchk.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.562297638206542  LUMO = -0.0421548009909793
+  beta  nocc = 19  HOMO = -0.470842244903458  LUMO = -0.144907201684381
+  HOMO = -0.470842244903  LUMO = -0.144907201684  gap/eV = 8.86914
+Initial guess E= -1556.84428519374  |g|= 0.0304741
+macro= 0  E= -1556.88909654474  delta_E= -0.0448114  |g|= 0.10175  3 KF 19 JK
+macro= 1  E= -1556.91577923999  delta_E= -0.0266827  |g|= 0.0245021  3 KF 11 JK
+macro= 2  E= -1556.91594242963  delta_E= -0.00016319  |g|= 5.5776e-05  3 KF 12 JK
+macro= 3  E= -1556.91594242963  delta_E= 1.36424e-12  |g|= 8.58381e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 4  E=-1556.91594242963  |g|= 8.58381e-06  total 11 KF 49 JK
+converged SCF energy = -1556.91594242963  <S^2> = 6.9615522  2S+1 = 5.3708667
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.16348852 0.17893716 0.1991405 ]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=rhfchk  E=-1556.9159424296256  converged=True  internal_stable=True  <S^2>=6.961552217545702
+
+======================================================================
+  UHF   H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.current.chk   charge=1  2S=4  basis=cc-pvdz-dk  sfX2C-1e   NEWTON   guess: current
+======================================================================
+
+
+
+
+******** <class 'pyscf.soscf.newton_ah.SecondOrdersfX2C1eUHF'> ********
+method = SecondOrdersfX2C1eUHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.current.chk
+max_memory 11264 MB (current use 183 MB)
+number electrons alpha = 23  beta = 19
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> Newton solver flags ********
+SCF tol = 1e-09
+conv_tol_grad = None
+max. SCF cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /resnick/groups/sharmagroup/yichi/work/ms_tm/dz/results_newton/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f/H2MnS-3a644ce0a423eab622cff5b8e1d94616ecb4a97f.uhf.current.chk
+max_cycle_inner = 12
+max_stepsize = 0.05
+ah_start_tol = 1e+09
+ah_level_shift = 0
+ah_conv_tol = 1e-12
+ah_lindep = 1e-14
+ah_start_cycle = 1
+ah_max_cycle = 40
+ah_grad_trust_region = 2.5
+kf_interval = 4
+kf_trust_region = 5
+canonicalization = True
+max_memory 11264 MB (current use 183 MB)
+Set conv_tol_grad to 3.16228e-05
+  alpha nocc = 23  HOMO = -0.645645783041425  LUMO = -0.0418904281937116
+  beta  nocc = 19  HOMO = -0.433061840393437  LUMO = -0.139048935998384
+  HOMO = -0.433061840393  LUMO = -0.139048935998  gap/eV = 8.00050
+Initial guess E= -1556.91594242952  |g|= 4.41006e-06
+macro= 0  E= -1556.91594242956  delta_E= -3.79714e-11  |g|= 4.41006e-06  1 KF 2 JK
+Canonicalize SCF orbitals
+macro X = 1  E=-1556.91594242956  |g|= 4.41006e-06  total 2 KF 4 JK
+converged SCF energy = -1556.91594242956  <S^2> = 6.9615536  2S+1 = 5.3708672
+--- stability analysis, round 0 ---
+uhf_internal: lowest eigs of H = [0.16348891 0.17893663 0.19913673]
+<class 'pyscf.x2c.sfx2c1e.sfX2C1eUHF'> wavefunction is stable in the internal stability analysis
+RESULT UHF NEWTON guess=current  E=-1556.9159424295572  converged=True  internal_stable=True  <S^2>=6.961553554567516
