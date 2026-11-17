@@ -190,8 +190,8 @@ def main():
     ap.add_argument('--methods', default='rhf,uhf', help='SCF references (default: %(default)s)')
     ap.add_argument('--frozen', default='chemcore', help="'chemcore' (default), 'none', or a number of orbitals")
     ap.add_argument('--max-cycle', type=int, default=200)
-    ap.add_argument('--conv-tol', type=float, default=1e-7, help='CCSD energy convergence (Eh)')
-    ap.add_argument('--conv-tol-normt', type=float, default=1e-6, help='CCSD amplitude convergence')
+    ap.add_argument('--conv-tol', type=float, default=1e-6, help='CCSD energy convergence (Eh)')
+    ap.add_argument('--conv-tol-normt', type=float, default=1e-5, help='CCSD amplitude convergence')
     ap.add_argument('--diis-space', type=int, default=10)
     ap.add_argument('--level-shift', type=float, default=0.0, help='CCSD level shift (helps hard cases)')
     ap.add_argument('--memory', type=int, default=4000, help='MB per calculation')
@@ -215,7 +215,8 @@ def main():
     for stem, paths in uniq.items():
         sysdir = os.path.join(a.outdir, stem)
         jf = lambda m: os.path.join(sysdir, '%s.%s.ccsd.json' % (stem, m))
-        todo = [m for m in methods if a.force or not os.path.exists(jf(m))]
+        # records that did not converge (or crashed) are run again
+        todo = [m for m in methods if a.force or not (load_json(jf(m)) or {}).get('converged')]
         if not todo:
             print('skip (done):', stem, flush=True)
             continue
